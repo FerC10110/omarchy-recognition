@@ -1,0 +1,3042 @@
+#!/usr/bin/python3
+"""Recognition engine: who is home, told by the devices seen on the local network.
+
+Every subcommand prints one JSON document on stdout. Errors of our own print
+{"error": "..."} and exit 1. Structured input arrives as one JSON line on
+stdin (save-person, assign, house, set-settings, save-command, test-command,
+run-command, run-commands only); only ids and MAC addresses travel as arguments.
+"""
+import concurrent.futures
+import contextlib
+import copy
+import datetime
+import fcntl
+import hashlib
+import ipaddress
+import json
+import os
+import re
+import secrets
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+import traceback
+
+USAGE = "Usage: recognition <command> [arguments]"
+UTC = datetime.timezone.utc
+
+
+class RecognitionError(Exception):
+    """An error we report to the panel as {"error": message}."""
+
+
+class ScanError(RecognitionError):
+    """A scan problem recorded in state.error instead of failing the call."""
+
+
+def utc_now():
+    return datetime.datetime.now(UTC)
+
+
+# ---- paths and time
+
+ISO_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+
+
+def _xdg(environ, key, fallback):
+    base = environ.get(key)
+    if base:
+        return base
+    return os.path.join(environ.get("HOME") or os.path.expanduser("~"), fallback)
+
+
+def people_path(environ):
+    return os.path.join(_xdg(environ, "XDG_CONFIG_HOME", ".config"), "recognition", "people.json")
+
+
+def state_path(environ):
+    return os.path.join(_xdg(environ, "XDG_STATE_HOME", os.path.join(".local", "state")),
+                        "recognition", "state.json")
+
+
+def lock_path(environ):
+    return os.path.join(os.path.dirname(state_path(environ)), "scan.lock")
+
+
+def iso(moment):
+    return moment.astimezone(UTC).strftime(ISO_FORMAT)
+
+
+def parse_iso(text):
+    if not isinstance(text, str):
+        return None
+    try:
+        return datetime.datetime.strptime(text, ISO_FORMAT).replace(tzinfo=UTC)
+    except ValueError:
+        return None
+
+
+def seconds_since(now, text):
+    moment = parse_iso(text)
+    return None if moment is None else (now - moment).total_seconds()
+
+
+def atomic_write_json(path, payload):
+    directory = os.path.dirname(path)
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(prefix=".tmp-", suffix=".tmp", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, ensure_ascii=False, indent=2)
+            fh.write("\n")
+        os.chmod(tmp_path, 0o600)
+        os.replace(tmp_path, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp_path)
+        raise
+
+
+# ---- people store
+
+MAC_RE = re.compile(r"^[0-9a-f]{2}(?::[0-9a-f]{2}){5}$")
+ID_RE = re.compile(r"^[0-9a-f]{32}$")
+NAME_MAX, EMOJI_MAX, LABEL_MAX = 64, 16, 64
+INTERVAL_RANGE, GRACE_RANGE = (10, 300), (60, 3600)
+HISTORY_DAYS_RANGE = (1, 365)
+HISTORY_SCOPES = ("none", "owned", "all")
+TIMELINE_LANES_MAX, TIMELINE_COMPARE_MAX = 500, 20
+HISTORY_KEYS = ("history", "historyDays", "historyDevices")
+HISTORY_VERSION = 1
+# Panel geometry, in pixels, 0 meaning "automatic". Ranges after Runbook's, with
+# the minimums lowered to what makes sense for this narrower panel.
+PANEL_WIDTH_RANGE, PANEL_HEIGHT_RANGE = (280, 4000), (240, 3000)
+PANEL_OFFSET_RANGE = (-4000, 4000)
+MIN_PREFIX = 22
+# Only a home LAN is worth scanning. Without this, a typo in Settings points nmap at
+# someone else's network every cycle, and ipaddress.is_private is no help: it says yes to 0.0.0.0/22.
+PRIVATE_NETWORKS = tuple(ipaddress.IPv4Network(cidr)
+                        for cidr in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"))
+NOTIFY_DEFAULTS = {"arrive": True, "leave": True, "neighbor": True, "guest": True,
+                   "unknown": True, "security": True, "home": False}
+NOTIFY_KEYS = tuple(NOTIFY_DEFAULTS)
+GROUPS = ("home", "neighbor", "guest")
+DEFAULT_SETTINGS = {"scanInterval": 20, "gracePeriod": 300, "subnet": "",
+                    "guestsOccupyHome": True,
+                    "readily": False,
+                    "history": False, "historyDays": 30, "historyDevices": "none",
+                    "timelineLanes": [], "timelineCompare": [],
+                    "panelWidth": 0, "panelHeight": 0, "panelX": 0, "panelY": 0,
+                    "notify": dict(NOTIFY_DEFAULTS)}
+EVENTS = ("arrive", "leave", "neighbor-arrive", "neighbor-leave", "guest-arrive", "guest-leave",
+          "home-occupied", "home-empty", "unknown", "alert", "manual")
+COMMAND_MAX, COMMANDS_MAX = 1000, 50
+
+
+def empty_people():
+    return {"version": 1, "people": [], "house": [], "commands": [],
+            "settings": copy.deepcopy(DEFAULT_SETTINGS)}
+
+
+def _has_control(text):
+    return any(ord(ch) < 32 or ord(ch) == 127 for ch in text)
+
+
+def normalize_mac(value):
+    if not isinstance(value, str):
+        raise RecognitionError("Not a valid MAC address")
+    mac = value.strip().lower().replace("-", ":")
+    if not MAC_RE.match(mac):
+        raise RecognitionError("Not a valid MAC address: " + value.strip()[:32])
+    return mac
+
+
+def _text(value, label, minimum, maximum):
+    if value is None:
+        value = ""
+    if not isinstance(value, str):
+        raise RecognitionError(f"{label}: must be text")
+    value = value.strip()
+    if not minimum <= len(value) <= maximum:
+        raise RecognitionError(f"{label}: between {minimum} and {maximum} characters")
+    if _has_control(value):
+        raise RecognitionError(f"{label}: cannot contain control characters")
+    return value
+
+
+def validate_name(value):
+    return _text(value, "Name", 1, NAME_MAX)
+
+
+def validate_emoji(value):
+    emoji = _text(value, "Emoji", 1, EMOJI_MAX)
+    if any(ch.isspace() for ch in emoji):
+        raise RecognitionError("Emoji: no spaces")
+    return emoji
+
+
+def validate_label(value):
+    return _text(value, "Label", 0, LABEL_MAX)
+
+
+def _bounded_int(value, bounds, label):
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise RecognitionError(f"{label}: must be a whole number")
+    if not bounds[0] <= value <= bounds[1]:
+        raise RecognitionError(f"{label}: between {bounds[0]} and {bounds[1]}")
+    return value
+
+
+def _panel_size(value, bounds, label):
+    """A stored panel dimension: 0, meaning automatic, or a size inside bounds."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise RecognitionError(f"{label}: must be a whole number")
+    if value == 0:
+        return 0
+    return _bounded_int(value, bounds, label)
+
+
+def validate_subnet(value):
+    if value is None:
+        value = ""
+    if not isinstance(value, str):
+        raise RecognitionError("Subnet: must be text")
+    value = value.strip()
+    if value == "":
+        return ""
+    try:
+        network = ipaddress.IPv4Network(value, strict=False)
+    except ValueError:
+        raise RecognitionError(f"Subnet: {value} is not a valid IPv4 network (e.g. 192.168.1.0/24)") from None
+    if not any(network.subnet_of(private) for private in PRIVATE_NETWORKS):
+        raise RecognitionError(f"Subnet: {network} is not a private network; "
+                               "use 10.x, 172.16-31.x or 192.168.x")
+    if network.prefixlen < MIN_PREFIX:
+        raise RecognitionError(f"Subnet: {network} is too large; use /{MIN_PREFIX} or smaller")
+    return str(network)
+
+
+def _validate_keys(value, cap, name):
+    """A saved selection of timeline lanes: strings, no repeats, capped. What a key means
+    is the panel's business -- a person or a MAC that no longer exists is simply not
+    drawn, so there is nothing to clean up here. Repeats collapse instead of failing: a
+    picker cannot produce one, and refusing to save over it would be the wrong answer."""
+    if not isinstance(value, list):
+        raise RecognitionError("Timeline: %s must be a list" % name)
+    if len(value) > cap:
+        raise RecognitionError("Timeline: %s takes at most %d entries" % (name, cap))
+    out = []
+    for entry in value:
+        if not isinstance(entry, str) or not entry:
+            raise RecognitionError("Timeline: %s must be a list of names" % name)
+        if entry not in out:
+            out.append(entry)
+    return out
+
+
+def validate_settings(raw, base):
+    """Merge a partial settings object over base, validating every key given."""
+    if not isinstance(raw, dict):
+        raise RecognitionError("Settings: must be a JSON object")
+    result = copy.deepcopy(base)
+    if "scanInterval" in raw:
+        result["scanInterval"] = _bounded_int(raw["scanInterval"], INTERVAL_RANGE, "Interval")
+    if "gracePeriod" in raw:
+        result["gracePeriod"] = _bounded_int(raw["gracePeriod"], GRACE_RANGE, "Grace period")
+    if "subnet" in raw:
+        result["subnet"] = validate_subnet(raw["subnet"])
+    if "guestsOccupyHome" in raw:
+        if not isinstance(raw["guestsOccupyHome"], bool):
+            raise RecognitionError("Guests: true or false")
+        result["guestsOccupyHome"] = raw["guestsOccupyHome"]
+    if "readily" in raw:
+        if not isinstance(raw["readily"], bool):
+            raise RecognitionError("Readily: true or false")
+        result["readily"] = raw["readily"]
+    if "history" in raw:
+        if not isinstance(raw["history"], bool):
+            raise RecognitionError("History: history must be true or false")
+        result["history"] = raw["history"]
+    if "historyDevices" in raw:
+        # A bool would pass `in` for neither word, but say so explicitly: the previous
+        # version wrote one here, and "must be true or false" would be the wrong advice.
+        if not isinstance(raw["historyDevices"], str) or raw["historyDevices"] not in HISTORY_SCOPES:
+            raise RecognitionError("History: devices must be none, owned or all")
+        result["historyDevices"] = raw["historyDevices"]
+    if "historyDays" in raw:
+        result["historyDays"] = _bounded_int(raw["historyDays"], HISTORY_DAYS_RANGE, "History days")
+    for key, cap in (("timelineLanes", TIMELINE_LANES_MAX),
+                     ("timelineCompare", TIMELINE_COMPARE_MAX)):
+        if key in raw:
+            result[key] = _validate_keys(raw[key], cap, key)
+    if "panelWidth" in raw:
+        result["panelWidth"] = _panel_size(raw["panelWidth"], PANEL_WIDTH_RANGE, "Panel width")
+    if "panelHeight" in raw:
+        result["panelHeight"] = _panel_size(raw["panelHeight"], PANEL_HEIGHT_RANGE, "Panel height")
+    if "panelX" in raw:
+        result["panelX"] = _bounded_int(raw["panelX"], PANEL_OFFSET_RANGE, "Panel x")
+    if "panelY" in raw:
+        result["panelY"] = _bounded_int(raw["panelY"], PANEL_OFFSET_RANGE, "Panel y")
+    if "notify" in raw:
+        notify = raw["notify"]
+        if not isinstance(notify, dict):
+            raise RecognitionError("Notifications: must be a JSON object")
+        for key in NOTIFY_KEYS:
+            if key in notify:
+                if not isinstance(notify[key], bool):
+                    raise RecognitionError(f"Notifications: {key} must be true or false")
+                result["notify"][key] = notify[key]
+    return result
+
+
+def repair_settings(raw):
+    """Settings read from disk: a key that does not validate falls back to its default."""
+    result = copy.deepcopy(DEFAULT_SETTINGS)
+    if not isinstance(raw, dict):
+        return result
+    for key in ("scanInterval", "gracePeriod", "subnet", "historyDays",
+                "timelineLanes", "timelineCompare",
+                "panelWidth", "panelHeight", "panelX", "panelY"):
+        if key in raw:
+            with contextlib.suppress(RecognitionError):
+                result = validate_settings({key: raw[key]}, result)
+    if isinstance(raw.get("guestsOccupyHome"), bool):
+        result["guestsOccupyHome"] = raw["guestsOccupyHome"]
+    if isinstance(raw.get("readily"), bool):
+        result["readily"] = raw["readily"]
+    if isinstance(raw.get("history"), bool):
+        result["history"] = raw["history"]
+    scope = raw.get("historyDevices")
+    if isinstance(scope, bool):
+        # feat/history wrote a boolean here; true meant "the devices I assigned".
+        result["historyDevices"] = "owned" if scope else "none"
+    elif isinstance(scope, str) and scope in HISTORY_SCOPES:
+        result["historyDevices"] = scope
+    notify = raw.get("notify")
+    if isinstance(notify, dict):
+        for key in NOTIFY_KEYS:
+            if isinstance(notify.get(key), bool):
+                result["notify"][key] = notify[key]
+    return result
+
+
+def validate_devices(value):
+    if value is None:
+        value = []
+    if not isinstance(value, list):
+        raise RecognitionError("Devices: must be a list")
+    devices, seen = [], set()
+    for item in value:
+        if not isinstance(item, dict):
+            raise RecognitionError("Devices: each one must be an object")
+        mac = normalize_mac(item.get("mac"))
+        if mac in seen:
+            raise RecognitionError(f"Devices: {mac} is repeated")
+        seen.add(mac)
+        # Whether this device counts toward its owner's presence. A file written before
+        # the flag existed has none, and back then every device counted.
+        counts = item.get("counts")
+        if counts is None:
+            counts = True
+        if not isinstance(counts, bool):
+            raise RecognitionError("Devices: counts must be true or false")
+        devices.append({"mac": mac, "label": validate_label(item.get("label")), "counts": counts})
+    return devices
+
+
+def validate_group(value):
+    """Which group a person belongs to. A file written before groups existed has none: it is a household."""
+    if value is None:
+        return "home"
+    if value not in GROUPS:
+        raise RecognitionError("Group: home, neighbor or guest")
+    return value
+
+
+def validate_notify(value):
+    """Whether this person's arrivals and departures notify. A file written before the
+    switch existed has none: it notifies, which is what it did until now."""
+    if value is None:
+        return True
+    if not isinstance(value, bool):
+        raise RecognitionError("Notify: true or false")
+    return value
+
+
+def validate_person(fields):
+    if not isinstance(fields, dict):
+        raise RecognitionError("The person must be a JSON object")
+    return {"name": validate_name(fields.get("name")),
+            "emoji": validate_emoji(fields.get("emoji")),
+            "group": validate_group(fields.get("group")),
+            "notify": validate_notify(fields.get("notify")),
+            "devices": validate_devices(fields.get("devices"))}
+
+
+def validate_command(value):
+    return _text(value, "Command", 1, COMMAND_MAX)
+
+
+def validate_events(value):
+    """The events a command runs on, without repeats and in EVENTS order."""
+    if not isinstance(value, list):
+        raise RecognitionError("Events: must be a list")
+    if not value:
+        raise RecognitionError("Events: pick at least one")
+    for event in value:
+        if event not in EVENTS:
+            raise RecognitionError("Events: unknown event " + str(event)[:32])
+    return [event for event in EVENTS if event in value]
+
+
+def validate_command_people(value):
+    """None (everyone) or person ids without repeats. The PERSON_EVENTS look at it, and so
+    does the right-click menu: a manual command only shows for the people it names."""
+    if value is None:
+        return None
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise RecognitionError("People: must be null or a list of person ids")
+    return list(dict.fromkeys(value))
+
+
+def _load_command(item, seen, person_ids):
+    """One entry of people.json's commands. Person ids that no longer exist are
+    dropped quietly: they are the ones delete-person would have removed."""
+    if not isinstance(item, dict):
+        raise RecognitionError("not an object")
+    command_id = item.get("id")
+    if not isinstance(command_id, str) or not ID_RE.match(command_id):
+        raise RecognitionError("doesn't have a valid id")
+    if command_id in seen:
+        raise RecognitionError(f"id {command_id} is repeated")
+    seen.add(command_id)
+    people = validate_command_people(item.get("people"))
+    if people is not None:
+        people = [person_id for person_id in people if person_id in person_ids]
+    return dict(item, command=validate_command(item.get("command")),
+                events=validate_events(item.get("events")), people=people)
+
+
+def _list(raw, key, name):
+    value = raw.get(key)
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise RecognitionError(f"{name}: {key} must be a list")
+    return value
+
+
+def load_people(path):
+    name = os.path.basename(path)
+    try:
+        with open(path, encoding="utf-8") as fh:
+            raw = json.load(fh)
+    except FileNotFoundError:
+        return empty_people()
+    except ValueError:
+        raise RecognitionError(f"{path} is not valid JSON; fix it or delete it") from None
+    if not isinstance(raw, dict):
+        raise RecognitionError(f"{name}: must be a JSON object")
+    data = dict(raw)
+    data["version"] = 1
+    data["settings"] = repair_settings(raw.get("settings"))
+    owners, ids, people, in_house = set(), set(), [], []
+
+    def claim(mac):
+        if mac in owners:
+            raise RecognitionError(f"{name}: {mac} appears more than once")
+        owners.add(mac)
+
+    for index, item in enumerate(_list(raw, "people", name), start=1):
+        if not isinstance(item, dict) or not isinstance(item.get("id"), str) or not ID_RE.match(item["id"]):
+            raise RecognitionError(f"{name}: person {index} doesn't have a valid id")
+        if item["id"] in ids:
+            raise RecognitionError(f"{name}: id {item['id']} is repeated")
+        ids.add(item["id"])
+        try:
+            person = dict(item, **validate_person(item))
+        except RecognitionError as exc:
+            raise RecognitionError(f"{name}: person {index}: {exc}") from None
+        for device in person["devices"]:
+            claim(device["mac"])
+        people.append(person)
+    # v1 called the House list "ignored": read both keys, write only "house".
+    # The key must go, or it would survive the save (unknown keys are kept)
+    # and the next load would see every one of its MACs twice.
+    entries = _list(raw, "house", name) + _list(raw, "ignored", name)
+    for index, item in enumerate(entries, start=1):
+        if not isinstance(item, dict):
+            raise RecognitionError(f"{name}: house entry {index} is not an object")
+        try:
+            entry = {"mac": normalize_mac(item.get("mac")), "label": validate_label(item.get("label"))}
+        except RecognitionError as exc:
+            raise RecognitionError(f"{name}: house entry {index}: {exc}") from None
+        claim(entry["mac"])
+        in_house.append(entry)
+    data.pop("ignored", None)
+    commands, command_ids = [], set()
+    for index, item in enumerate(_list(raw, "commands", name), start=1):
+        try:
+            commands.append(_load_command(item, command_ids, ids))
+        except RecognitionError as exc:
+            raise RecognitionError(f"{name}: command {index}: {exc}") from None
+    data["people"], data["house"], data["commands"] = people, in_house, commands
+    return data
+
+
+def save_people(path, data):
+    atomic_write_json(path, data)
+
+
+def find_person(data, person_id):
+    for person in data["people"]:
+        if person["id"] == person_id:
+            return person
+    return None
+
+
+def _require_person(data, person_id):
+    person = find_person(data, person_id)
+    if person is None:
+        raise RecognitionError("That person no longer exists")
+    return person
+
+
+def owner_of(data, mac):
+    """The person that has mac, "house" when it is in House, or None."""
+    for person in data["people"]:
+        if any(device["mac"] == mac for device in person["devices"]):
+            return person
+    if any(entry["mac"] == mac for entry in data["house"]):
+        return "house"
+    return None
+
+
+def release(data, mac):
+    """Take mac away from every person and from House."""
+    for person in data["people"]:
+        person["devices"] = [device for device in person["devices"] if device["mac"] != mac]
+    data["house"] = [entry for entry in data["house"] if entry["mac"] != mac]
+
+
+def save_person(data, fields):
+    clean = validate_person(fields)
+    person_id = fields.get("id")
+    person = _require_person(data, person_id) if person_id else None
+    for device in clean["devices"]:
+        release(data, device["mac"])
+    if person is None:
+        person = {"id": secrets.token_hex(16)}
+        data["people"].append(person)
+    person.update(clean)
+    return person
+
+
+def delete_person(data, person_id):
+    data["people"].remove(_require_person(data, person_id))
+    for command in data["commands"]:
+        if command["people"] is not None:
+            command["people"] = [other for other in command["people"] if other != person_id]
+
+
+def household_people(data):
+    """The people who live here: the ones the bar and the home events talk about."""
+    return [person for person in data["people"] if person.get("group", "home") == "home"]
+
+
+def neighbor_people(data):
+    """The people who don't live here but use the Wi-Fi."""
+    return [person for person in data["people"] if person.get("group") == "neighbor"]
+
+
+def guest_people(data):
+    """The people who don't live here but are inside the house while they're connected."""
+    return [person for person in data["people"] if person.get("group") == "guest"]
+
+
+def assign(data, mac, person_id, label):
+    mac = normalize_mac(mac)
+    label = validate_label(label)
+    person = _require_person(data, person_id)
+    release(data, mac)
+    person["devices"].append({"mac": mac, "label": label, "counts": True})
+
+
+def unassign(data, mac):
+    mac = normalize_mac(mac)
+    if not isinstance(owner_of(data, mac), dict):
+        raise RecognitionError("That device isn't assigned to anyone")
+    release(data, mac)
+
+
+def house(data, mac, label):
+    """Put mac in House under label. A device already in House is renamed."""
+    mac = normalize_mac(mac)
+    label = validate_label(label)
+    release(data, mac)
+    data["house"].append({"mac": mac, "label": label})
+
+
+def unhouse(data, mac):
+    mac = normalize_mac(mac)
+    if owner_of(data, mac) != "house":
+        raise RecognitionError("That device isn't in House")
+    release(data, mac)
+
+
+def find_command(data, command_id):
+    for command in data["commands"]:
+        if command["id"] == command_id:
+            return command
+    return None
+
+
+def save_command(data, fields):
+    """Create (no id) or replace (id) a command; returns it."""
+    clean = {"command": validate_command(fields.get("command")),
+             "events": validate_events(fields.get("events")),
+             "people": validate_command_people(fields.get("people"))}
+    for person_id in clean["people"] or []:
+        _require_person(data, person_id)
+    command_id = fields.get("id")
+    if command_id:
+        command = find_command(data, command_id)
+        if command is None:
+            raise RecognitionError("That command no longer exists")
+    else:
+        if len(data["commands"]) >= COMMANDS_MAX:
+            raise RecognitionError(f"You can have at most {COMMANDS_MAX} of your own commands")
+        command = {"id": secrets.token_hex(16)}
+        data["commands"].append(command)
+    command.update(clean)
+    return command
+
+
+def delete_command(data, command_id):
+    command = find_command(data, command_id)
+    if command is None:
+        raise RecognitionError("That command no longer exists")
+    data["commands"].remove(command)
+
+
+def auto_label(device):
+    """A label for a device about to be assigned or put in House without one."""
+    if device:
+        if device.get("hostname"):
+            return device["hostname"][:LABEL_MAX]
+        if device.get("vendor"):
+            return device["vendor"][:LABEL_MAX]
+        if device.get("randomMac"):
+            return "Random MAC"
+    return "Device"
+
+
+# ---- state store
+
+STATE_SHAPE = {"devices": dict, "people": dict, "ipOwners": dict, "alerts": list,
+               "dismissed": dict, "gateway": dict}
+
+
+def empty_state():
+    return {"version": 1, "lastScan": None, "lastAttempt": None, "watchingSince": None,
+            "subnet": "", "error": None,
+            "gateway": {"ip": "", "acceptedMac": "", "seenMac": ""},
+            "devices": {}, "people": {}, "ipOwners": {}, "alerts": [], "dismissed": {},
+            "history": {"open": {}, "cont": [], "gap": None, "prunedOn": None}}
+
+
+def load_state(path):
+    """(state, existed). A missing or broken file is a fresh state: it is only a cache."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            raw = json.load(fh)
+    except (OSError, ValueError):
+        return empty_state(), False
+    if not isinstance(raw, dict) or any(not isinstance(raw.get(key), kind) for key, kind in STATE_SHAPE.items()):
+        return empty_state(), False
+    if (any(not isinstance(v, dict) for v in raw["devices"].values())
+            or any(not isinstance(v, dict) for v in raw["people"].values())
+            or any(not isinstance(v, dict) for v in raw["ipOwners"].values())
+            or any(not isinstance(a, dict) for a in raw["alerts"])):
+        return empty_state(), False
+    state = empty_state()
+    state.update(raw)
+    state["gateway"] = dict(empty_state()["gateway"], **raw["gateway"])
+    # A state.json written before the history existed has no book; it gets an empty one
+    # instead of being thrown away, so an upgrade does not lose the device cache. Each
+    # field is checked on its own: a book the engine cannot walk used to crash every
+    # scan before save_state, so it could not even repair itself.
+    state["history"] = _repair_book(raw.get("history"))
+    return state, True
+
+
+def _repair_book(raw):
+    """The history half of state.json, with every field it can use and nothing else."""
+    book = empty_state()["history"]
+    if not isinstance(raw, dict):
+        return book
+    spans = raw.get("open")
+    if isinstance(spans, dict):
+        book["open"] = {key: value for key, value in spans.items()
+                        if isinstance(key, str) and isinstance(value, str)
+                        and key.partition(":")[0] in SPAN_STATE}
+    cont = raw.get("cont")
+    if isinstance(cont, list):
+        book["cont"] = [key for key in cont if isinstance(key, str) and key in book["open"]]
+    if isinstance(raw.get("gap"), dict):
+        book["gap"] = raw["gap"]
+    if isinstance(raw.get("prunedOn"), str):
+        book["prunedOn"] = raw["prunedOn"]
+    return book
+
+
+def save_state(path, state):
+    atomic_write_json(path, state)
+
+
+@contextlib.contextmanager
+def _lock(path, blocking):
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    with open(path, "a") as fh:
+        try:
+            fcntl.flock(fh, fcntl.LOCK_EX if blocking else fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+
+
+def scan_lock(environ):
+    """Held for a whole scan; a second scan skips instead of waiting."""
+    return _lock(lock_path(environ), blocking=False)
+
+
+def state_lock(environ):
+    """Held by the few subcommands that write state.json outside a scan."""
+    return _lock(lock_path(environ), blocking=True)
+
+
+# ---- command results
+
+
+def results_path(environ):
+    return os.path.join(os.path.dirname(state_path(environ)), "commands.json")
+
+
+def results_lock_path(environ):
+    return os.path.join(os.path.dirname(state_path(environ)), "commands.lock")
+
+
+def load_results(environ):
+    """id -> the last result of that command. A missing or broken file is empty: it is only a cache."""
+    try:
+        with open(results_path(environ), encoding="utf-8") as fh:
+            raw = json.load(fh)
+    except (OSError, ValueError):
+        return {}
+    results = raw.get("results") if isinstance(raw, dict) else None
+    if not isinstance(results, dict):
+        return {}
+    return {key: value for key, value in results.items() if isinstance(value, dict)}
+
+
+def results_lock(environ):
+    """Held while a runner job updates commands.json."""
+    return _lock(results_lock_path(environ), blocking=True)
+
+
+READILY_RESULTS_MAX = 50
+
+
+def _cap_readily(results):
+    """At most READILY_RESULTS_MAX Readily results, the most recent by `at`. A note
+    deleted in Obsidian leaves its result behind and nothing can prune it with
+    certainty — the engine cannot tell "that note is gone" from "Readily could not be
+    read right now" — so this cap is what keeps the file bounded."""
+    readily = [(value.get("at") or "", key) for key, value in results.items()
+               if value.get("source") == "readily"]
+    if len(readily) <= READILY_RESULTS_MAX:
+        return results
+    readily.sort(reverse=True)
+    dropped = {key for _, key in readily[READILY_RESULTS_MAX:]}
+    return {key: value for key, value in results.items() if key not in dropped}
+
+
+def prune_results(environ, data):
+    """Drop the results an edit or a delete left behind: their command text is gone from people.json, so
+    nothing will ever show them again and the text would outlive the command it belongs to. A Readily
+    result is never dropped this way — people.json knows nothing about Readily commands — but is still
+    capped by _cap_readily."""
+    with results_lock(environ):
+        results = load_results(environ)
+        current = {command["id"]: command["command"] for command in data["commands"]}
+        kept = {key: value for key, value in results.items()
+                if value.get("source") == "readily"
+                or (key in current and value.get("command") == current[key])}
+        kept = _cap_readily(kept)
+        if kept != results:
+            atomic_write_json(results_path(environ), {"version": 1, "results": kept})
+
+
+def record_result(environ, command_id, result):
+    """Store one command's last result (spec §3.5). Ids no longer in people.json are dropped, and so is
+    a result for text that was edited while it ran: it would hide the newer text's result. A Readily
+    result is exempt from both: people.json has never heard of it, so there is nothing to check it
+    against — it is capped by _cap_readily instead."""
+    with results_lock(environ):
+        results = load_results(environ)
+        try:
+            current = {command["id"]: command["command"] for command in load_people(people_path(environ))["commands"]}
+        except RecognitionError:
+            current = None
+        from_readily = result.get("source") == "readily"
+        if from_readily or current is None or current.get(command_id) == result.get("command"):
+            results[command_id] = result
+        if current is not None:
+            results = {key: value for key, value in results.items()
+                       if key in current or value.get("source") == "readily"}
+        atomic_write_json(results_path(environ), {"version": 1, "results": _cap_readily(results)})
+
+
+# ---- history
+
+def history_dir(environ):
+    """Where the history lives. Not next to state.json: that one is a cache and is
+    thrown away when it does not parse, and this is the only copy of what happened."""
+    return os.path.join(_xdg(environ, "XDG_DATA_HOME", os.path.join(".local", "share")),
+                        "recognition", "history")
+
+
+def history_path(environ, month):
+    """The file for one month, named YYYY-MM.json."""
+    return os.path.join(history_dir(environ), month + ".json")
+
+
+def empty_month(month):
+    return {"version": HISTORY_VERSION, "month": month, "devices": {}, "days": {}}
+
+
+def load_month(environ, month):
+    """The month's file. A file that does not parse is moved aside, never overwritten:
+    state.json is a cache and can be thrown away, this is the only copy of what
+    happened, and the bytes stay put in case they are worth rescuing by hand."""
+    path = history_path(environ, month)
+    try:
+        with open(path, encoding="utf-8") as fh:
+            raw = json.load(fh)
+    except OSError:
+        return empty_month(month)
+    except ValueError:
+        raw = None
+    if not isinstance(raw, dict) or not isinstance(raw.get("days"), dict):
+        with contextlib.suppress(OSError):
+            os.replace(path, history_path(environ, month + ".broken"))
+        return empty_month(month)
+    payload = empty_month(month)
+    payload["days"] = {day: _clean_slot(slot) for day, slot in raw["days"].items()
+                       if isinstance(day, str) and isinstance(slot, dict)}
+    payload["devices"] = _clean_book(raw.get("devices"))
+    return payload
+
+
+def _clean_book(raw):
+    """The month's little name book: what each MAC was called the last time a span of it
+    was written here. Checked field by field for the same reason as the days -- the file
+    is meant to be read and edited by hand, and a bad edit must not take a scan down."""
+    if not isinstance(raw, dict):
+        return {}
+    book = {}
+    for mac, entry in raw.items():
+        if not isinstance(mac, str) or not isinstance(entry, dict):
+            continue
+        book[mac] = {"label": entry["label"] if isinstance(entry.get("label"), str) else "",
+                     "vendor": entry["vendor"] if isinstance(entry.get("vendor"), str) else "",
+                     "randomMac": entry.get("randomMac") is True}
+    return book
+
+
+def _clean_slot(slot):
+    """One day, in the shape the rest of the code assumes. A file that parses can still
+    have been hand-edited into something that would crash a scan -- and the README
+    invites exactly that editing -- so the shape is checked here, once."""
+    out = {}
+    spans = slot.get("spans")
+    if isinstance(spans, list):
+        out["spans"] = [span for span in spans if isinstance(span, dict)]
+    totals = slot.get("totals")
+    if isinstance(totals, dict):
+        out["totals"] = {group: {key: value
+                                 for key, value in (totals.get(group) or {}).items()
+                                 if isinstance(key, str) and isinstance(value, dict)}
+                         if isinstance(totals.get(group), dict) else {}
+                         for group in ("people", "devices")}
+    return out
+
+
+def _count(bucket, field):
+    """A count out of a totals bucket. A hand-edited file can hold a string where a
+    number belongs; that costs the number, not the dashboard."""
+    value = bucket.get(field)
+    return value if isinstance(value, int) and not isinstance(value, bool) else 0
+
+
+def save_month(environ, month, payload):
+    atomic_write_json(history_path(environ, month), payload)
+
+
+def local_day(moment):
+    """The local calendar day an instant falls on, as YYYY-MM-DD. Days are local because
+    "how long was Bri home on Friday" is a question about her Friday, not about UTC's."""
+    return moment.astimezone().strftime("%Y-%m-%d")
+
+
+def day_start(moment):
+    """Local midnight opening the day `moment` falls on."""
+    return moment.astimezone().replace(hour=0, minute=0, second=0, microsecond=0)
+
+
+def split_by_day(start, end):
+    """[(day, from, to)] for one span, cut at every local midnight it crosses.
+    astimezone() freezes the offset of that instant, so this is exact wherever the
+    offset does not move -- Argentina has no daylight saving."""
+    pieces = []
+    while start < end:
+        edge = day_start(start) + datetime.timedelta(days=1)
+        stop = min(edge, end)
+        pieces.append((local_day(start), start, stop))
+        start = stop
+    return pieces
+
+
+class HistoryWriter:
+    """The month files one cycle touches, held open until the end of it. Writing a span
+    used to be read-modify-write per subject; with the scope set to `all` a measuring gap
+    writes one span for every device on the network, and that would rewrite the same file
+    a hundred times in a single scan."""
+
+    def __init__(self, environ):
+        self.environ = environ
+        self._months = {}
+        self._dirty = set()
+        self._names = {}
+        self._macs = {}
+
+    def month(self, key):
+        if key not in self._months:
+            self._months[key] = load_month(self.environ, key)
+        return self._months[key]
+
+    def touched(self, key, mac=None):
+        self._dirty.add(key)
+        if mac is not None:
+            self._macs.setdefault(key, set()).add(mac)
+
+    def name(self, mac, info):
+        """What this MAC is called right now. Only reaches disk for the months that end
+        up holding a span of it -- see the name book. An entry with nothing in it is
+        dropped instead of stored: a device the cache already forgot would otherwise
+        erase the name an earlier write got right."""
+        if info and (info.get("label") or info.get("vendor") or info.get("randomMac")):
+            self._names[mac] = info
+
+    def flush(self):
+        for key in sorted(self._dirty):
+            payload = self._months[key]
+            book = payload.setdefault("devices", {})
+            for mac in sorted(self._macs.get(key, ())):
+                info = self._names.get(mac)
+                if info:
+                    book[mac] = info
+            save_month(self.environ, key, payload)
+        self._months, self._dirty, self._macs = {}, set(), {}
+
+
+def record_span(environ, subject, start, end, state, cont=False, writer=None):
+    """Write one closed span, cut at every local midnight, into the month files it
+    touches. `subject` is ("person", id) or ("mac", mac) -- the same two words that
+    prefix the keys of state["history"]["open"]. Without a `writer` it opens one of its
+    own and flushes it, so a single call still lands on disk by itself."""
+    if end <= start:
+        return
+    kind, key = subject
+    own = writer is None
+    writer = writer if writer is not None else HistoryWriter(environ)
+    for index, (day, piece_start, piece_end) in enumerate(split_by_day(start, end)):
+        span = {kind: key, "from": iso(piece_start), "to": iso(piece_end), "state": state}
+        if index or cont:
+            # Without this, a stay across midnight -- or one the prune already cut at the
+            # edge of the sealed region -- would count as two arrivals.
+            span["cont"] = True
+        month = day[:7]
+        slot = writer.month(month)["days"].setdefault(day, {})
+        if "totals" in slot:
+            # The day was sealed. Its hours are already in the totals -- the prune folds
+            # in whatever was still open when it sealed -- so writing the piece here
+            # would count them twice.
+            continue
+        slot.setdefault("spans", []).append(span)
+        writer.touched(month, key if kind == "mac" else None)
+    if own:
+        writer.flush()
+
+
+SPAN_STATE = {"person": "home", "mac": "on"}
+
+
+def _history_subjects(data, state, settings):
+    """Everyone and everything the history follows. The scope decides how far it reaches:
+    "none" is the home group alone, "owned" adds the devices you assigned to them, and
+    "all" adds every MAC the scanner has in its cache -- House, unassigned, and the
+    hardware that only passes through. A device that was assigned but never seen is not
+    in the cache and has no history to tell, so it is not a subject either."""
+    scope = settings["historyDevices"]
+    subjects = []
+    for person in household_people(data):
+        subjects.append(("person", person["id"]))
+        if scope == "owned":
+            subjects.extend(("mac", entry["mac"]) for entry in person["devices"])
+    if scope == "all":
+        # Sorted so the walk -- and every file it writes -- is the same on every run.
+        # No interleaving here: House and the passing hardware belong to nobody.
+        subjects.extend(("mac", mac) for mac in sorted(state["devices"]))
+    return subjects
+
+
+def _device_name(data, state, mac):
+    """What to call a MAC in the month file: the label you gave it, the vendor the
+    scanner guessed, and whether it looks like a phone's rotating address. The owner is
+    deliberately not stored -- it changes, and the panel already knows the current one."""
+    device = state["devices"].get(mac) or {}
+    owner = owner_of(data, mac)
+    entries = data["house"] if owner == "house" else (owner["devices"] if isinstance(owner, dict) else [])
+    label = ""
+    for entry in entries:
+        if entry["mac"] == mac:
+            label = entry.get("label") or ""
+            break
+    return {"label": label,
+            "vendor": device.get("vendor") or "",
+            "randomMac": bool(device.get("randomMac"))}
+
+
+def _history_reading(subject, data, state):
+    """(present, lastSeen) for one subject. A person by the rule that already exists --
+    only the devices that count -- and a device by its own sightings, so the PC marked
+    as not counting still keeps its own history."""
+    kind, key = subject
+    if kind == "person":
+        person = find_person(data, key)
+        if person is None:
+            return False, None
+        present, _, last = person_presence(person, state["devices"])
+        return present, last
+    device = state["devices"].get(key)
+    if device is None:
+        return False, None
+    return bool(device.get("present")), device.get("lastSeen")
+
+
+def _history_drop_cont(book, key):
+    """This span is not the tail of an older one any more."""
+    if key in (book.get("cont") or ()):
+        book["cont"] = [entry for entry in book["cont"] if entry != key]
+
+
+def _history_close(environ, state, subject, key, end, writer=None):
+    """Close one subject's open span at `end` (an ISO string) and write it out."""
+    book = state["history"]
+    started = parse_iso(book["open"].pop(key, None))
+    cont = key in (book.get("cont") or ())
+    _history_drop_cont(book, key)
+    stop = parse_iso(end)
+    if started is not None and stop is not None:
+        record_span(environ, subject, started, stop, SPAN_STATE[subject[0]],
+                    cont=cont, writer=writer)
+
+
+def _history_resolve_gap(environ, state, data, settings, now, writer=None):
+    """Decide what the gap was worth, now that the readings are trustworthy again. The
+    same state on both sides means the gap counts as that state, and a span that was
+    open was never cut. A state that changed means nothing can be claimed about the
+    gap, so it is written as unknown: neither home nor away."""
+    book = state["history"]
+    last = parse_iso(book["gap"].get("lastSeen"))
+    book["gap"] = None
+    if last is None or last >= now:
+        return
+    for subject in _history_subjects(data, state, settings):
+        key = "%s:%s" % subject
+        was = key in book["open"]
+        present, _ = _history_reading(subject, data, state)
+        if was == present:
+            continue
+        if was:
+            _history_close(environ, state, subject, key, iso(last), writer=writer)
+        else:
+            book["open"][key] = iso(now)
+            _history_drop_cont(book, key)
+        record_span(environ, subject, last, now, "unknown", writer=writer)
+
+
+def history_tick(environ, state, data, settings, now, gap_from=None):
+    """Open and close spans for this cycle. Called at the end of scan(), inside the scan
+    lock, after update_people. Turning a switch on never records backwards: the span
+    starts now, not at the `since` the engine already knew. Every span this cycle writes
+    goes through one writer, so a gap that touches every device on the network costs one
+    write per month."""
+    writer = HistoryWriter(environ)
+    try:
+        _history_tick(environ, state, data, settings, now, gap_from, writer)
+    finally:
+        writer.flush()
+
+
+def _history_tick(environ, state, data, settings, now, gap_from, writer):
+    book = state["history"]
+    if settings["history"]:
+        if gap_from:
+            # Nothing was measured between gap_from and now, and nothing is decided yet
+            # either: on this cycle apply_sightings is still holding the present devices
+            # up so the PC's nap does not read as everyone leaving. A second gap on top
+            # of a pending one keeps the first lastSeen -- it is the last real one.
+            gap = book.get("gap") or {"lastSeen": gap_from}
+            gap["resolveAfter"] = iso(now + datetime.timedelta(seconds=settings["gracePeriod"]))
+            book["gap"] = gap
+            return
+        if book.get("gap"):
+            if (seconds_since(now, book["gap"].get("resolveAfter")) or 0) < 0:
+                return
+            _history_resolve_gap(environ, state, data, settings, now, writer=writer)
+    else:
+        book["gap"] = None
+    subjects = _history_subjects(data, state, settings) if settings["history"] else []
+    live = {"%s:%s" % subject: subject for subject in subjects}
+    # Stamp what every MAC is called right now: the ones still followed, and the ones
+    # whose span is about to close precisely because they are not. A device that left the
+    # cache takes its vendor with it, and the month file is the only place that will
+    # remember it.
+    for key in sorted(set(book["open"]) | set(live)):
+        kind, _, ident = key.partition(":")
+        if kind == "mac":
+            writer.name(ident, _device_name(data, state, ident))
+    # Someone we stopped following: a switch went off, a person left the home group, a
+    # device was unassigned. Their span closes honestly, at their last sighting.
+    for key in sorted(set(book["open"]) - set(live)):
+        kind, _, ident = key.partition(":")
+        if kind not in SPAN_STATE:
+            book["open"].pop(key, None)
+            _history_drop_cont(book, key)
+            continue
+        _, last = _history_reading((kind, ident), data, state)
+        _history_close(environ, state, (kind, ident), key, last or iso(now), writer=writer)
+    for key, subject in sorted(live.items()):
+        present, last = _history_reading(subject, data, state)
+        if present and key not in book["open"]:
+            book["open"][key] = iso(now)
+            _history_drop_cont(book, key)
+        elif not present and key in book["open"]:
+            # The span ends at the last sighting, not now: between the two there is a
+            # gracePeriod, which exists so a phone sleeping its Wi-Fi does not read as a
+            # departure. Closing here would inflate every stay by five minutes.
+            _history_close(environ, state, subject, key, last or iso(now), writer=writer)
+
+
+def seal_spans(spans):
+    """Spans -> totals. `arrivals` counts the spans that are NOT the continuation of one
+    cut at midnight, so a stay across midnight is one arrival, not two. The same
+    function adds up a day that is still running, so there is one code path."""
+    totals = {"people": {}, "devices": {}}
+    for span in spans:
+        kind = "person" if "person" in span else "mac"
+        key = span.get(kind)
+        start, end = parse_iso(span.get("from")), parse_iso(span.get("to"))
+        if not isinstance(key, str) or start is None or end is None or end <= start:
+            continue
+        field = SPAN_STATE[kind]
+        group = totals["people" if kind == "person" else "devices"]
+        bucket = group.setdefault(key, {field: 0, "unknown": 0, "arrivals": 0})
+        seconds = int((end - start).total_seconds())
+        if span.get("state") == "unknown":
+            bucket["unknown"] += seconds
+        else:
+            bucket[field] += seconds
+            if not span.get("cont"):
+                bucket["arrivals"] += 1
+    return totals
+
+
+def history_cutoff(settings, now):
+    """The oldest day that keeps its detail. `historyDays` is how many days of detail
+    there are, today included: 1 means today only."""
+    return local_day(day_start(now) - datetime.timedelta(days=settings["historyDays"] - 1))
+
+
+def prune_history(environ, state, settings, now, force=False):
+    """Seal every day older than the retention: its spans become totals and vanish. The
+    unit is the whole day, so a half-sealed day cannot exist and running this twice
+    changes nothing. It walks every file, not just the current month: with 30 days of
+    detail, early in October there are still September days to seal. And it runs with
+    the history switched off, because the retention is a promise about what is on disk,
+    not about what is being recorded."""
+    book = state["history"]
+    today = local_day(now)
+    if not force and book.get("prunedOn") == today:
+        return
+    book["prunedOn"] = today
+    cutoff = history_cutoff(settings, now)
+    # A span still open has written nothing yet: it lives in the book. Sealing a day from
+    # the file alone would drop the hours it already covers -- and for a PC that answers
+    # ARP in its sleep and never closes its span, that is every day it lived through. So
+    # the open book is folded into the days being sealed, and then cut at the edge of the
+    # sealed region so closing it later does not write those hours a second time.
+    live = history_open_spans(state, now)
+    try:
+        names = sorted(os.listdir(history_dir(environ)))
+    except OSError:
+        names = []
+    months = {name[:-len(".json")] for name in names
+              if name.endswith(".json") and not name.endswith(".broken.json")}
+    months |= {day[:7] for day in live if day < cutoff}
+    for month in sorted(months):
+        payload = load_month(environ, month)
+        touched = False
+        for day in sorted(set(payload["days"]) | {key for key in live if key[:7] == month}):
+            slot = payload["days"].get(day) or {}
+            if day >= cutoff or "totals" in slot or ("spans" not in slot and day not in live):
+                continue
+            payload["days"][day] = {"totals": seal_spans(list(slot.get("spans") or [])
+                                                         + live.get(day, []))}
+            touched = True
+        if touched:
+            save_month(environ, month, payload)
+    _history_trim_open(book, cutoff)
+
+
+def _day_midnight(day):
+    """The instant local midnight opens `day` (YYYY-MM-DD)."""
+    return datetime.datetime.strptime(day, "%Y-%m-%d").astimezone()
+
+
+def _history_trim_open(book, cutoff):
+    """Move every open span's start to the first day that still keeps its detail. The key
+    is remembered in `cont` so the piece written when the span finally closes reads as
+    the tail of the same stay, not as a second arrival."""
+    edge = _day_midnight(cutoff)
+    cont = book.setdefault("cont", [])
+    for key, started in sorted((book.get("open") or {}).items()):
+        start = parse_iso(started)
+        if start is None or start >= edge:
+            continue
+        book["open"][key] = iso(edge)
+        if key not in cont:
+            cont.append(key)
+
+
+def _history_cycle(environ, state, data, settings, now, gap_from=None):
+    """The history half of a scan. The presence answer is what the panel is waiting for,
+    and the history is the optional part: a data home that is read-only or full costs
+    the history and is reported, but the cycle still finishes and the state is still
+    saved. Without this the scanner stops for good, and -- because lastAttempt is never
+    written either -- every later cycle also reads as a measuring gap."""
+    try:
+        history_tick(environ, state, data, settings, now, gap_from)
+        prune_history(environ, state, settings, now)
+    except OSError as exc:
+        state["error"] = state.get("error") or ("History: " + str(exc))
+
+
+PERIODS = ("day", "week", "month")
+
+
+def history_period(period, day):
+    """(first, last) local dates of the period containing `day`. One date format, not
+    three: the caller says `week` and the engine finds the Monday."""
+    if period not in PERIODS:
+        raise RecognitionError("History: period must be day, week or month")
+    try:
+        date = datetime.datetime.strptime(day, "%Y-%m-%d").date()
+    except (TypeError, ValueError):
+        raise RecognitionError("History: date must be YYYY-MM-DD")
+    if period == "day":
+        return date.isoformat(), date.isoformat()
+    if period == "week":
+        first = date - datetime.timedelta(days=date.weekday())
+        return first.isoformat(), (first + datetime.timedelta(days=6)).isoformat()
+    first = date.replace(day=1)
+    nxt = (first.replace(year=first.year + 1, month=1) if first.month == 12
+           else first.replace(month=first.month + 1))
+    return first.isoformat(), (nxt - datetime.timedelta(days=1)).isoformat()
+
+
+def history_open_spans(state, now):
+    """{day: [span]} for the spans still open, cut by local day like the stored ones.
+    With a gap pending they stop at the last measured instant: what happened after it is
+    exactly what has not been decided yet."""
+    book = state.get("history") or {}
+    end = parse_iso((book.get("gap") or {}).get("lastSeen")) or now
+    cont, out = set(book.get("cont") or ()), {}
+    for key, started in sorted((book.get("open") or {}).items()):
+        kind, _, ident = key.partition(":")
+        start = parse_iso(started)
+        if start is None or kind not in SPAN_STATE or start >= end:
+            continue
+        for index, (day, piece_start, piece_end) in enumerate(split_by_day(start, end)):
+            span = {kind: ident, "from": iso(piece_start), "to": iso(piece_end),
+                    "state": SPAN_STATE[kind]}
+            if index or key in cont:
+                span["cont"] = True
+            out.setdefault(day, []).append(span)
+    return out
+
+
+def history_earliest(environ):
+    """The oldest day with anything in it, or None. It answers whether the left arrow
+    has anywhere to go."""
+    try:
+        names = sorted(name for name in os.listdir(history_dir(environ))
+                       if name.endswith(".json") and not name.endswith(".broken.json"))
+    except OSError:
+        return None
+    for name in names:
+        payload = load_month(environ, name[:-len(".json")])
+        if payload["days"]:
+            return min(payload["days"])
+    return None
+
+
+def _history_days(environ, state, settings, now, first, last):
+    """[(day, totals, detail)] across the period. Sealed days, detailed days and the day
+    still running all come out the same shape, through seal_spans."""
+    live = history_open_spans(state, now)
+    cache, out = {}, []
+    day = datetime.datetime.strptime(first, "%Y-%m-%d").date()
+    stop = datetime.datetime.strptime(last, "%Y-%m-%d").date()
+    while day <= stop:
+        key = day.isoformat()
+        if key[:7] not in cache:
+            cache[key[:7]] = load_month(environ, key[:7])
+        slot = cache[key[:7]]["days"].get(key) or {}
+        if "totals" in slot:
+            out.append((key, slot["totals"], False))
+        else:
+            # `detail` is "the spans for this day are still there", not "the retention
+            # says they should be": between local midnight and that day's prune both
+            # answers differ, and the panel would deny a list it is showing.
+            spans = list(slot.get("spans") or []) + live.get(key, [])
+            out.append((key, seal_spans(spans), True))
+        day += datetime.timedelta(days=1)
+    return out
+
+
+def _history_ranking(data, days):
+    """Every person in the home group, even the ones with nothing: a comparison needs the
+    whole list. Most time first, and ties by id so the order never wobbles."""
+    rows = {person["id"]: {"id": person["id"], "home": 0, "unknown": 0, "arrivals": 0}
+            for person in household_people(data)}
+    for _, totals, _ in days:
+        for key, bucket in totals["people"].items():
+            row = rows.get(key)
+            if row is None:
+                continue        # deleted, or no longer in the home group
+            for field in ("home", "unknown", "arrivals"):
+                row[field] += _count(bucket, field)
+    return sorted(rows.values(), key=lambda row: (-row["home"], row["id"]))
+
+
+
+def history_report(environ, data, state, settings, now, period, day, person_id=None):
+    """The numbers the panel draws. Names and emojis are not here: they come from
+    people.json, which the panel already has. The engine answers numbers."""
+    first, last = history_period(period, day)
+    days = _history_days(environ, state, settings, now, first, last)
+    earliest = history_earliest(environ)
+    before = (datetime.datetime.strptime(first, "%Y-%m-%d").date()
+              - datetime.timedelta(days=1)).isoformat()
+    after = (datetime.datetime.strptime(last, "%Y-%m-%d").date()
+             + datetime.timedelta(days=1)).isoformat()
+    report = {"period": period, "from": first, "to": last,
+              "prev": before if earliest is not None and before >= earliest else None,
+              "next": after if after <= local_day(now) else None,
+              # The floor for the panel's calendar. `prev` only answers whether one step
+              # back lands on something; a grid of days has to know where to stop.
+              "earliest": earliest,
+              "enabled": bool(settings["history"]),
+              "trackDevices": settings["historyDevices"] != "none",
+              "keepDays": settings["historyDays"]}
+    if person_id is None:
+        report["people"] = _history_ranking(data, days)
+        return report
+    person = _require_person(data, person_id)
+    macs = [entry["mac"] for entry in person["devices"]]
+    total = {"id": person["id"], "home": 0, "unknown": 0, "arrivals": 0}
+    devices = {mac: {"mac": mac, "on": 0, "unknown": 0, "arrivals": 0} for mac in macs}
+    rows = []
+    for key, totals, detail in days:
+        bucket = totals["people"].get(person["id"]) or {}
+        rows.append({"day": key, "home": _count(bucket, "home"),
+                     "unknown": _count(bucket, "unknown"),
+                     "arrivals": _count(bucket, "arrivals"), "detail": detail})
+        for field in ("home", "unknown", "arrivals"):
+            total[field] += _count(bucket, field)
+        for mac, row in devices.items():
+            got = totals["devices"].get(mac) or {}
+            for field in ("on", "unknown", "arrivals"):
+                row[field] += _count(got, field)
+    report["person"] = total
+    report["days"] = rows
+    report["devices"] = ([devices[mac] for mac in macs]
+                         if settings["historyDevices"] != "none" else [])
+    return report
+
+
+def _timeline_days(environ, state, now, first, last):
+    """[(day, spans, detail)] across the period, plus the merged name book of the months
+    it touched. A sealed day has no spans left: its detail went with the retention that
+    was asked for, and the grid says so instead of drawing an empty row for no reason."""
+    live = history_open_spans(state, now)
+    cache, out, book = {}, [], {}
+    day = datetime.datetime.strptime(first, "%Y-%m-%d").date()
+    stop = datetime.datetime.strptime(last, "%Y-%m-%d").date()
+    while day <= stop:
+        key = day.isoformat()
+        month = key[:7]
+        if month not in cache:
+            cache[month] = load_month(environ, month)
+            # Walked oldest first, so a later month's name for the same MAC wins.
+            book.update(cache[month]["devices"])
+        slot = cache[month]["days"].get(key) or {}
+        if "totals" in slot:
+            out.append((key, [], False))
+        else:
+            out.append((key, list(slot.get("spans") or []) + live.get(key, []), True))
+        day += datetime.timedelta(days=1)
+    return out, book
+
+
+def _lane_day(spans, kind, key):
+    """One lane's slice of one day: the spans to draw, and the numbers for the column on
+    the right. The numbers come out of seal_spans -- the same function the rest of the
+    history adds up with -- so the grid and the ranking can never drift apart."""
+    field = SPAN_STATE[kind]
+    mine = []
+    for span in spans:
+        if span.get(kind) != key:
+            continue
+        start, end = parse_iso(span.get("from")), parse_iso(span.get("to"))
+        if start is None or end is None or end <= start:
+            continue
+        mine.append(span)
+    mine.sort(key=lambda span: span["from"])
+    group = seal_spans(mine)["people" if kind == "person" else "devices"]
+    bucket = group.get(key) or {}
+    return {"total": bucket.get(field, 0), "unknown": bucket.get("unknown", 0),
+            "arrivals": bucket.get("arrivals", 0),
+            "spans": [{"from": span["from"], "to": span["to"],
+                       "state": span.get("state") or field} for span in mine]}
+
+
+def _lane_label(book, mac):
+    entry = book.get(mac) or {}
+    return entry.get("label") or entry.get("vendor") or ""
+
+
+def _device_lane(data, book, mac, days):
+    """A device's lane. This is the one place the engine puts text in an answer: the MAC
+    may have left the device cache weeks ago, and the month file is the only thing that
+    still knows what it was called."""
+    entry = book.get(mac) or {}
+    owner = owner_of(data, mac)
+    return {"key": "mac:" + mac, "kind": "device", "mac": mac,
+            "label": entry.get("label") or "", "vendor": entry.get("vendor") or "",
+            "randomMac": bool(entry.get("randomMac")),
+            "owner": owner if isinstance(owner, str) else (owner["id"] if owner else None),
+            "days": [dict(_lane_day(spans, "mac", mac), day=key) for key, spans, _ in days]}
+
+
+def _timeline_lanes(data, days, book, period):
+    """One lane per subject, in the order the panel draws them: each person of the home
+    group followed by their own devices, then House by label, then everything else.
+
+    Every person gets a lane even with nothing to show -- the list of who you can compare
+    should not change shape depending on who happened to be home. A device only gets one
+    when it actually has a span in the period, so a name left in the book by a month that
+    is no longer on screen does not become an empty row.
+
+    A week or a month brings people only. Thirty days by forty lanes is not a drawing,
+    and which device was on at three in the morning is a question about a day."""
+    macs = set()
+    for _, spans, _ in days:
+        for span in spans:
+            if isinstance(span.get("mac"), str):
+                macs.add(span["mac"])
+    lanes = []
+    for person in household_people(data):
+        lanes.append({"key": "person:" + person["id"], "kind": "person", "id": person["id"],
+                      "days": [dict(_lane_day(spans, "person", person["id"]), day=key)
+                               for key, spans, _ in days]})
+        if period == "day":
+            for entry in person["devices"]:
+                if entry["mac"] in macs:
+                    lanes.append(_device_lane(data, book, entry["mac"], days))
+                    macs.discard(entry["mac"])
+    if period != "day":
+        return lanes
+    for entry in sorted(data["house"], key=lambda e: (e["label"].lower(), e["mac"])):
+        if entry["mac"] in macs:
+            lanes.append(_device_lane(data, book, entry["mac"], days))
+            macs.discard(entry["mac"])
+    for mac in sorted(macs, key=lambda mac: (_lane_label(book, mac).lower(), mac)):
+        lanes.append(_device_lane(data, book, mac, days))
+    return lanes
+
+
+def timeline_report(environ, data, state, settings, now, period, day):
+    """The grid the panel draws: spans in place of totals, and a lane per subject instead
+    of one row per person. The period arithmetic is history_report's, unchanged."""
+    first, last = history_period(period, day)
+    earliest = history_earliest(environ)
+    before = (datetime.datetime.strptime(first, "%Y-%m-%d").date()
+              - datetime.timedelta(days=1)).isoformat()
+    after = (datetime.datetime.strptime(last, "%Y-%m-%d").date()
+             + datetime.timedelta(days=1)).isoformat()
+    days, book = _timeline_days(environ, state, now, first, last)
+    return {"period": period, "from": first, "to": last,
+            "prev": before if earliest is not None and before >= earliest else None,
+            "next": after if after <= local_day(now) else None,
+            # The floor for the panel's calendar. `prev` only answers whether one step
+            # back lands on something; a grid of days has to know where to stop.
+            "earliest": earliest,
+            "enabled": bool(settings["history"]),
+            "scope": settings["historyDevices"],
+            "keepDays": settings["historyDays"],
+            "days": [{"day": key, "detail": detail} for key, _, detail in days],
+            "lanes": _timeline_lanes(data, days, book, period)}
+
+
+def forget_history(environ, state, subjects):
+    """Drop these subjects from every file and from the open book. Deleting a person is
+    a deliberate, confirmed act, and leaving their movements on disk afterwards would be
+    a surprise. Unassigning a device is routine, and routine does not destroy anything,
+    so nothing calls this for one."""
+    people = {key for kind, key in subjects if kind == "person"}
+    macs = {key for kind, key in subjects if kind == "mac"}
+    for subject in subjects:
+        key = "%s:%s" % subject
+        state["history"]["open"].pop(key, None)
+        _history_drop_cont(state["history"], key)
+    try:
+        names = sorted(os.listdir(history_dir(environ)))
+    except OSError:
+        return
+    for name in names:
+        if not name.endswith(".json") or name.endswith(".broken.json"):
+            continue
+        month = name[:-len(".json")]
+        payload = load_month(environ, month)
+        touched = False
+        for slot in payload["days"].values():
+            spans = slot.get("spans")
+            if isinstance(spans, list):
+                kept = [span for span in spans
+                        if span.get("person") not in people and span.get("mac") not in macs]
+                if len(kept) != len(spans):
+                    slot["spans"], touched = kept, True
+            totals = slot.get("totals")
+            if not isinstance(totals, dict):
+                continue
+            for group, doomed in (("people", people), ("devices", macs)):
+                bucket = totals.get(group)
+                if not isinstance(bucket, dict):
+                    continue
+                for key in [key for key in bucket if key in doomed]:
+                    del bucket[key]
+                    touched = True
+        if touched:
+            save_month(environ, month, payload)
+
+
+def delete_history(environ, state):
+    """Remove everything. The switch alone never does this: it stops recording and
+    leaves what is there, so a history can be paused and picked up again."""
+    state["history"] = empty_state()["history"]
+    shutil.rmtree(history_dir(environ), ignore_errors=True)
+
+
+# ---- network
+
+NMAP_TIMEOUT = 60
+# The longest a live cycle can take: one nmap timeout, plus hostname lookups, ip calls and notification sends.
+SCAN_ALLOWANCE = NMAP_TIMEOUT + 30
+NMAP_MISSING = "nmap isn't installed (omarchy pkg add nmap)"
+NO_NETWORK = "Couldn't find the local network; set the subnet in Settings"
+OUI_PATH = "/usr/share/nmap/nmap-mac-prefixes"
+REPORT_RE = re.compile(r"^Nmap scan report for (\d{1,3}(?:\.\d{1,3}){3})\s*$", re.M)
+
+
+def _ip_json(run, *args):
+    try:
+        result = run(["ip", "-j", *args], capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ScanError(f"Couldn't query the network: {exc}") from None
+    if result.returncode != 0:
+        raise ScanError("Couldn't query the network: " + (result.stderr or "").strip()[:200])
+    try:
+        payload = json.loads(result.stdout or "[]")
+    except ValueError:
+        raise ScanError("ip returned a response I don't understand") from None
+    return payload if isinstance(payload, list) else []
+
+
+def default_route(run):
+    """(gateway ip or "", interface) of the IPv4 default route, or None."""
+    for route in _ip_json(run, "-4", "route", "show", "default"):
+        if isinstance(route, dict) and route.get("dev"):
+            return route.get("gateway", ""), route["dev"]
+    return None
+
+
+def interface_network(run, dev):
+    for link in _ip_json(run, "-4", "addr", "show", "dev", dev):
+        for info in (link.get("addr_info") or []) if isinstance(link, dict) else []:
+            if info.get("family") == "inet" and info.get("local") and isinstance(info.get("prefixlen"), int):
+                try:
+                    return ipaddress.IPv4Network(f"{info['local']}/{info['prefixlen']}", strict=False)
+                except ValueError:
+                    continue
+    return None
+
+
+def resolve_network(settings, run):
+    """The network to scan and the router's IP inside it ("" when unknown)."""
+    route = default_route(run)
+    gateway = route[0] if route else ""
+    if settings["subnet"]:
+        network = ipaddress.IPv4Network(settings["subnet"])
+    else:
+        network = interface_network(run, route[1]) if route else None
+        if network is None:
+            raise ScanError(NO_NETWORK)
+        if network.prefixlen < MIN_PREFIX:
+            raise ScanError(f"The network {network} is too large to scan; "
+                            f"set a /{MIN_PREFIX} or smaller subnet in Settings")
+    try:
+        if gateway and ipaddress.IPv4Address(gateway) not in network:
+            gateway = ""
+    except ValueError:
+        gateway = ""
+    return {"network": network, "gateway": gateway}
+
+
+def nmap_up(run, network):
+    """IPs nmap reports up. The real point is the side effect: the kernel ARPs every address."""
+    try:
+        result = run(["nmap", "-sn", "-n", "-T4", str(network)],
+                     capture_output=True, text=True, timeout=NMAP_TIMEOUT)
+    except FileNotFoundError:
+        raise ScanError(NMAP_MISSING) from None
+    except subprocess.TimeoutExpired:
+        raise ScanError(f"nmap didn't finish in {NMAP_TIMEOUT} s; keeping the previous state") from None
+    except OSError as exc:
+        raise ScanError(f"Couldn't run nmap: {exc}") from None
+    if result.returncode != 0:
+        raise ScanError("nmap failed: " + (result.stderr or "").strip()[:200])
+    return set(REPORT_RE.findall(result.stdout or ""))
+
+
+def read_neighbors(run, network):
+    """ip -> {"mac", "reachable"} for ARP entries inside network that carry a MAC."""
+    table = {}
+    for entry in _ip_json(run, "-4", "neigh", "show"):
+        if not isinstance(entry, dict) or not entry.get("lladdr") or not entry.get("dst"):
+            continue
+        try:
+            if ipaddress.IPv4Address(entry["dst"]) not in network:
+                continue
+            mac = normalize_mac(entry["lladdr"])
+        except (ValueError, RecognitionError):
+            continue
+        table[entry["dst"]] = {"mac": mac, "reachable": "REACHABLE" in (entry.get("state") or [])}
+    return table
+
+
+def sightings(neighbors, up):
+    """mac -> ip seen in this cycle: the kernel confirmed it (REACHABLE) or nmap saw the IP up.
+    DELAY/PROBE only mean the kernel is still checking, so they do not count.
+    One mac answering for several IPs keeps only the lowest: this is the map
+    device records and presence are built from."""
+    seen = {}
+    for ip in sorted(neighbors, key=ipaddress.IPv4Address):
+        entry = neighbors[ip]
+        if (entry["reachable"] or ip in up) and entry["mac"] not in seen:
+            seen[entry["mac"]] = ip
+    return seen
+
+
+def confirmed_ips(neighbors, up):
+    """ip -> mac for every confirmed neighbour entry this cycle (same confirmation
+    rule as sightings: REACHABLE, or nmap saw the IP up). Unlike sightings, this
+    keeps every confirmed IP, not just the lowest per mac: one mac answering for
+    several IPs is ARP spoofing, and check_gateway/check_ip_conflicts need to see
+    every IP it answered for to catch it regardless of IP order."""
+    return {ip: entry["mac"] for ip, entry in neighbors.items() if entry["reachable"] or ip in up}
+
+
+def load_oui(path=OUI_PATH):
+    table = {}
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                if line.startswith("#"):
+                    continue
+                prefix, _, vendor = line.strip().partition(" ")
+                if prefix and vendor.strip():
+                    table[prefix.upper()] = vendor.strip()
+    except OSError:
+        pass
+    return table
+
+
+def vendor_for(mac, table):
+    digits = mac.replace(":", "").upper()
+    for size in (9, 7, 6):
+        vendor = table.get(digits[:size])
+        if vendor:
+            return vendor
+    return ""
+
+
+def is_random_mac(mac):
+    """Locally administered bit set: phones use such a MAC per Wi-Fi network."""
+    return bool(int(mac[1], 16) & 0x2)
+
+
+def _norm_hostname(name):
+    """A hostname as this matching compares it: case and the mDNS domain are noise."""
+    name = (name if isinstance(name, str) else "").strip().lower()
+    for suffix in (".local", ".lan"):
+        if name.endswith(suffix):
+            return name[:-len(suffix)]
+    return name
+
+
+def suggest_owner(device, data, devices):
+    """The person whose phone this unknown device probably is. A phone that rotates its
+    MAC keeps its network name: the old device stops being seen and a new one appears
+    with the same hostname. Exactly one person or nothing — a wrong suggestion costs
+    more than a missing one, because it is accepted with one click."""
+    hostname = _norm_hostname(device.get("hostname"))
+    first_seen = device.get("firstSeen")
+    if not hostname or not isinstance(first_seen, str) or not first_seen:
+        return None
+    found = []
+    for person in data["people"]:
+        for entry in person["devices"]:
+            old = devices.get(entry["mac"])
+            if old is None or old.get("present"):
+                continue
+            last_seen = old.get("lastSeen")
+            # A fixed-width ISO string sorts as its own date. The old device has to
+            # have gone quiet BEFORE the new one appeared: that order is what tells a
+            # rotation apart from two different phones sharing a generic name.
+            if not isinstance(last_seen, str) or not last_seen or last_seen >= first_seen:
+                continue
+            if _norm_hostname(old.get("hostname")) != hostname:
+                continue
+            found.append({"personId": person["id"], "name": person["name"], "emoji": person["emoji"],
+                          "mac": entry["mac"], "label": entry["label"], "lastSeen": last_seen})
+    if not found:
+        return None
+    # Every candidate is one person's: which of their dead phones the name came from
+    # does not change the answer, and this is what makes the offer survive the second
+    # rotation, when the person already owns the MAC that the first one left behind.
+    if len({candidate["personId"] for candidate in found}) > 1:
+        return None
+    return max(found, key=lambda candidate: candidate["lastSeen"])
+
+
+def _sanitize_hostname(name):
+    """R23: an mDNS hostname is untrusted input that ends up as a notification
+    body. Drop non-printable characters, then leading '-' characters, so it
+    cannot be read as an option by omarchy-notification-send."""
+    name = "".join(ch for ch in name if ch.isprintable())
+    return name.lstrip("-")
+
+
+def resolve_hostname(run, ip):
+    try:
+        result = run(["avahi-resolve", "-a", ip], capture_output=True, text=True, timeout=1)
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    if result.returncode != 0:
+        return ""
+    for line in (result.stdout or "").splitlines():
+        parts = line.split("\t")
+        if len(parts) == 2 and parts[0].strip() == ip:
+            name = parts[1].strip()
+            name = name[:-len(".local")] if name.endswith(".local") else name
+            return _sanitize_hostname(name)
+    return ""
+
+
+# ---- presence
+
+HOSTNAME_RETRY = 3600
+# A phone that renames itself keeps the old name until this passes. It is the name
+# suggest_owner matches a rotated MAC by, so a name left to rot turns the owner's own
+# phone into a stranger the next time Android rerolls its MAC.
+HOSTNAME_REFRESH = 86400
+HOSTNAME_BUDGET = 8
+
+
+def new_device(now):
+    return {"ip": "", "hostname": "", "vendor": "", "randomMac": False, "firstSeen": iso(now),
+            "lastSeen": None, "present": False, "since": None, "hostnameCheckedAt": None}
+
+
+def apply_sightings(state, seen, now, grace, watching_since=None):
+    """Record this cycle's sightings and recompute device presence.
+    watching_since (ISO string or None) caps a present device's measured
+    absence at the time since the scanner started watching again: downtime
+    (the PC off or suspended, or the shell down) is not read as the device
+    having left. Does not touch lastSeen: it stays a true sighting time.
+    Returns (arrived, left, new) as sorted MAC lists."""
+    devices = state["devices"]
+    new = []
+    for mac, ip in seen.items():
+        device = devices.get(mac)
+        if device is None:
+            device = devices[mac] = new_device(now)
+            new.append(mac)
+        device["ip"] = ip
+        device["lastSeen"] = iso(now)
+    watching_age = seconds_since(now, watching_since)
+    arrived, left = [], []
+    for mac, device in devices.items():
+        age = seconds_since(now, device.get("lastSeen"))
+        if age is not None and watching_age is not None and device.get("present"):
+            age = min(age, watching_age)
+        present = age is not None and age <= grace
+        if present and not device.get("present"):
+            device["present"], device["since"] = True, iso(now)
+            arrived.append(mac)
+        elif not present and device.get("present"):
+            device["present"], device["since"] = False, None
+            left.append(mac)
+    return sorted(arrived), sorted(left), sorted(new)
+
+
+def enrich(state, seen, new, now, run, oui_loader):
+    """Vendor once for new devices; hostname for the ones seen this cycle, at most
+    HOSTNAME_BUDGET lookups per cycle. A device without a name is retried every
+    HOSTNAME_RETRY, one that has a name is checked again every HOSTNAME_REFRESH."""
+    devices = state["devices"]
+    if new:
+        table = oui_loader()
+        for mac in new:
+            device = devices[mac]
+            device["randomMac"] = is_random_mac(mac)
+            device["vendor"] = "" if device["randomMac"] else vendor_for(mac, table)
+    budget = HOSTNAME_BUDGET
+    for mac in sorted(seen):
+        device = devices[mac]
+        if budget == 0:
+            continue
+        wait = HOSTNAME_REFRESH if device.get("hostname") else HOSTNAME_RETRY
+        checked = seconds_since(now, device.get("hostnameCheckedAt"))
+        if checked is not None and checked < wait:
+            continue
+        found = resolve_hostname(run, seen[mac])
+        # mDNS misses a sleeping phone all the time. A lookup that answers nothing is
+        # no reason to throw away a name that worked: it is what pairs this device's
+        # next MAC with its owner. The stamp still moves, so it is not asked again
+        # until the next window.
+        if found or not device.get("hostname"):
+            device["hostname"] = found
+        device["hostnameCheckedAt"] = iso(now)
+        budget -= 1
+
+
+def person_presence(person, devices):
+    """(present, since, lastSeen) of a person from the devices that count. A device with
+    counts False is theirs but says nothing about them: an always-on printer must not make
+    them present, and must not make them "seen just now" either."""
+    since, last = [], []
+    for entry in person["devices"]:
+        if not entry.get("counts", True):
+            continue
+        device = devices.get(entry["mac"])
+        if not device:
+            continue
+        if device.get("lastSeen"):
+            last.append(device["lastSeen"])
+        if device.get("present") and device.get("since"):
+            since.append(device["since"])
+    return bool(since), (min(since) if since else None), (max(last) if last else None)
+
+
+def update_people(state, data, arrived, left):
+    """Refresh state.people and return (came, went) for notifications.
+
+    A person comes only when one of their devices arrived in this cycle and
+    goes only when one of their devices left in it, so assigning a device
+    that is already here, or unassigning one, never reads as coming or going."""
+    arrived, left = set(arrived), set(left)
+    came, went, fresh = [], [], {}
+    for person in data["people"]:
+        present, since, _ = person_presence(person, state["devices"])
+        was = bool(state["people"].get(person["id"], {}).get("present"))
+        macs = {device["mac"] for device in person["devices"] if device.get("counts", True)}
+        if present and not was and macs & arrived:
+            came.append(person)
+        elif was and not present and macs & left:
+            went.append(person)
+        fresh[person["id"]] = {"present": present, "since": since}
+    state["people"] = fresh
+    return came, went
+
+
+# ---- alerts
+
+ALERT_COOLDOWN = 3600
+
+
+def add_alert(state, kind, key, data, now):
+    """Store a new alert unless the same one is active or was dismissed less than an hour ago."""
+    full_key = f"{kind}:{key}"
+    if any(alert.get("key") == full_key for alert in state["alerts"]):
+        return None
+    dismissed = seconds_since(now, state["dismissed"].get(full_key))
+    if dismissed is not None and dismissed < ALERT_COOLDOWN:
+        return None
+    alert = {"id": secrets.token_hex(8), "kind": kind, "key": full_key, "createdAt": iso(now), "data": data}
+    state["alerts"].append(alert)
+    return alert
+
+
+def prune_dismissed(state, now):
+    keep = {}
+    for key, moment in state["dismissed"].items():
+        age = seconds_since(now, moment)
+        if age is not None and age < ALERT_COOLDOWN:
+            keep[key] = moment
+    state["dismissed"] = keep
+
+
+def check_gateway(state, gateway_ip, confirmed, now):
+    """Remember the router's MAC the first time; alert when another MAC answers for its IP.
+    confirmed is ip -> mac (confirmed_ips): it must see every IP a mac answered
+    for, not just its lowest, or a spoofed gateway IP can hide behind it."""
+    if not gateway_ip:
+        return []
+    mac = confirmed.get(gateway_ip)
+    if mac is None:
+        return []
+    gateway = state["gateway"]
+    if gateway.get("ip") != gateway_ip or not gateway.get("acceptedMac"):
+        state["gateway"] = {"ip": gateway_ip, "acceptedMac": mac, "seenMac": mac}
+        return []
+    gateway["seenMac"] = mac
+    if mac == gateway["acceptedMac"]:
+        return []
+    alert = add_alert(state, "gateway-mac", f"{gateway_ip}|{mac}",
+                      {"ip": gateway_ip, "expectedMac": gateway["acceptedMac"], "seenMac": mac}, now)
+    return [alert] if alert else []
+
+
+def check_ip_conflicts(state, confirmed, now, grace, gateway_ip):
+    """Alert when an IP moved to a new MAC while its previous owner was seen within
+    the grace period and is not seen elsewhere now (that would be DHCP renumbering).
+    Must run after apply_sightings: the previous owner's lastSeen is untouched then.
+    confirmed is ip -> mac (confirmed_ips): it must see every IP a mac answered
+    for, not just its lowest, or a spoofed IP can hide behind another of its IPs."""
+    alerts = []
+    owners = state["ipOwners"]
+    for ip, mac in sorted(confirmed.items(), key=lambda item: ipaddress.IPv4Address(item[0])):
+        previous = owners.get(ip)
+        owners[ip] = {"mac": mac, "seenAt": iso(now)}
+        if not previous or previous.get("mac") == mac or ip == gateway_ip:
+            continue
+        old = previous.get("mac")
+        if old in confirmed.values():
+            continue
+        age = seconds_since(now, (state["devices"].get(old) or {}).get("lastSeen"))
+        if age is None or age > grace:
+            continue
+        alert = add_alert(state, "ip-conflict", f"{ip}|{old}|{mac}",
+                          {"ip": ip, "previousMac": old, "mac": mac}, now)
+        if alert:
+            alerts.append(alert)
+    return alerts
+
+
+def dismiss_alert(state, alert_id, now):
+    alert = next((a for a in state["alerts"] if a.get("id") == alert_id), None)
+    if alert is None:
+        raise RecognitionError("That alert no longer exists")
+    state["alerts"].remove(alert)
+    state["dismissed"][alert["key"]] = iso(now)
+
+
+def accept_gateway(state):
+    gateway = state["gateway"]
+    if not gateway.get("seenMac"):
+        raise RecognitionError("Haven't seen the router yet")
+    gateway["acceptedMac"] = gateway["seenMac"]
+    state["alerts"] = [alert for alert in state["alerts"] if alert.get("kind") != "gateway-mac"]
+
+
+def forget_device(state, data, mac):
+    mac = normalize_mac(mac)
+    if owner_of(data, mac) is not None:
+        raise RecognitionError("Only devices that are unassigned and not in House can be forgotten")
+    if mac not in state["devices"]:
+        raise RecognitionError("I don't know that device")
+    del state["devices"][mac]
+    state["ipOwners"] = {ip: owner for ip, owner in state["ipOwners"].items() if owner.get("mac") != mac}
+
+
+DEVICE_RETENTION = 30 * 86400
+
+
+def prune_devices(state, data, now):
+    """R22: drop devices that belong to no one (owner_of is None; a person's
+    devices and House devices return non-None and are kept), that are not present, and whose
+    lastSeen is older than DEVICE_RETENTION. A pruned device that returns is new
+    again, like forget_device."""
+    devices = state["devices"]
+    stale = [mac for mac, device in devices.items()
+            if owner_of(data, mac) is None and not device.get("present")
+            and (seconds_since(now, device.get("lastSeen")) or 0) > DEVICE_RETENTION]
+    for mac in stale:
+        del devices[mac]
+    if stale:
+        state["ipOwners"] = {ip: owner for ip, owner in state["ipOwners"].items()
+                             if owner.get("mac") not in stale}
+
+
+# ---- notifications
+
+PLUGIN_ID = "io.github.ferc10110.recognition"
+NOTIFY_BIN = "omarchy-notification-send"
+WARNING_GLYPH = "\U000f0026"   # nf-md-alert
+HOME_GLYPH = "🏠"
+SUMMON = ["--exec", "omarchy-shell", "shell", "summon", PLUGIN_ID]
+
+
+def describe_device(device, mac):
+    first = device.get("vendor") or ("Random MAC" if device.get("randomMac") else "")
+    parts = [part for part in (first, device.get("hostname"), device.get("ip")) if part]
+    return " · ".join(parts) if parts else mac
+
+
+def alert_title_body(alert):
+    data = alert["data"]
+    if alert["kind"] == "gateway-mac":
+        return "Router MAC changed", f"{data['ip']}: expected {data['expectedMac']}, answered {data['seenMac']}"
+    return "IP address conflict", f"{data['ip']} moved from {data['previousMac']} to {data['mac']}"
+
+
+def alert_notification(alert):
+    title, body = alert_title_body(alert)
+    urgency = "critical" if alert["kind"] == "gateway-mac" else "normal"
+    return [NOTIFY_BIN, "-g", WARNING_GLYPH, "-u", urgency, title, body] + SUMMON
+
+
+def split_groups(people):
+    """Split people into (household, neighbors, guests): the group predicate build_notifications
+    and build_events both need. "household" is the people who live here, never to be
+    confused with House (data["house"]), which is a group of devices, not people."""
+    household = [person for person in people if person.get("group", "home") == "home"]
+    neighbors = [person for person in people if person.get("group") == "neighbor"]
+    guests = [person for person in people if person.get("group") == "guest"]
+    return household, neighbors, guests
+
+
+def _notified(people):
+    """The people whose own switch is on. A record written before the switch existed has none."""
+    return [person for person in people if person.get("notify", True)]
+
+
+def build_notifications(settings, came, went, unknown, alerts, devices):
+    notify = settings["notify"]
+    calls = []
+    household_came, neighbor_came, guest_came = split_groups(_notified(came))
+    household_went, neighbor_went, guest_went = split_groups(_notified(went))
+    if notify["arrive"]:
+        calls += [[NOTIFY_BIN, "-g", p["emoji"], "-u", "normal", f"{p['name']} arrived home"] for p in household_came]
+    if notify["leave"]:
+        calls += [[NOTIFY_BIN, "-g", p["emoji"], "-u", "low", f"{p['name']} left"] for p in household_went]
+    if notify["neighbor"]:
+        calls += [[NOTIFY_BIN, "-g", p["emoji"], "-u", "normal", f"{p['name']} joined the Wi-Fi"] for p in neighbor_came]
+        calls += [[NOTIFY_BIN, "-g", p["emoji"], "-u", "low", f"{p['name']} left the Wi-Fi"] for p in neighbor_went]
+    if notify["guest"]:
+        calls += [[NOTIFY_BIN, "-g", p["emoji"], "-u", "normal", f"{p['name']} is visiting"] for p in guest_came]
+        calls += [[NOTIFY_BIN, "-g", p["emoji"], "-u", "low", f"{p['name']} went home"] for p in guest_went]
+    if notify["unknown"]:
+        calls += [[NOTIFY_BIN, "-g", WARNING_GLYPH, "-u", "normal", "New device on the network",
+                   describe_device(devices.get(mac) or {}, mac)] + SUMMON for mac in unknown]
+    if notify["security"]:
+        calls += [alert_notification(alert) for alert in alerts]
+    return calls
+
+
+HOME_URGENCY = {"home-occupied": "normal", "home-empty": "low"}
+
+
+def build_home_notifications(settings, events):
+    """The house filling up or emptying out. The text is the event's own, so the phrase
+    a command receives and the one the notification shows can never drift apart."""
+    if not settings["notify"]["home"]:
+        return []
+    return [[NOTIFY_BIN, "-g", HOME_GLYPH, "-u", HOME_URGENCY[event["event"]], event["message"]]
+            for event in events if event["event"] in HOME_URGENCY]
+
+
+def send_notifications(calls, run):
+    """omarchy-notification-send talks D-Bus and returns at once (the click action is a hint)."""
+    for argv in calls:
+        with contextlib.suppress(OSError, subprocess.TimeoutExpired):
+            run(argv, capture_output=True, text=True, timeout=5)
+
+
+# ---- command events
+
+ENGINE_PATH = os.path.abspath(__file__)
+
+
+def _person_view(person):
+    return {"id": person["id"], "name": person["name"], "emoji": person["emoji"]}
+
+
+def _names(people):
+    return ", ".join(person["name"] for person in people)
+
+
+def build_events(came, went, unknown, alerts, devices, home_before, home, now, guests=(), guests_occupy=True):
+    """The events of one scan, in job order (spec §3.3). home_before is how many people
+    occupied the house before this cycle; home is the names of the household at home after
+    it, and guests the names of the guests connected. guests_occupy is the setting that says
+    whether a guest counts as someone in the house."""
+    events = []
+
+    def add(name, message, people=(), device=None, alert=None):
+        views = [_person_view(person) for person in people]
+        events.append({"event": name, "at": iso(now), "message": message,
+                       "person": views[0] if views else None, "people": views,
+                       "home": list(home), "guests": list(guests),
+                       "device": device, "alert": alert})
+
+    household_came, neighbor_came, guest_came = split_groups(came)
+    household_went, neighbor_went, guest_went = split_groups(went)
+
+    for person in household_came:
+        add("arrive", f"{person['name']} arrived home", [person])
+    for person in household_went:
+        add("leave", f"{person['name']} left", [person])
+    for person in neighbor_came:
+        add("neighbor-arrive", f"{person['name']} joined the Wi-Fi", [person])
+    for person in neighbor_went:
+        add("neighbor-leave", f"{person['name']} left the Wi-Fi", [person])
+    for person in guest_came:
+        add("guest-arrive", f"{person['name']} is visiting", [person])
+    for person in guest_went:
+        add("guest-leave", f"{person['name']} went home", [person])
+    # A guest occupies the house only if the setting says so; the household always does.
+    occupying_came = household_came + (guest_came if guests_occupy else [])
+    occupying_went = household_went + (guest_went if guests_occupy else [])
+    occupied = bool(home) or (guests_occupy and bool(guests))
+    if occupying_came and not home_before:
+        add("home-occupied", f"Home is occupied ({_names(occupying_came)} arrived)", occupying_came)
+    if occupying_went and not occupied:
+        add("home-empty", f"Home is empty ({_names(occupying_went)} left)", occupying_went)
+    for mac in unknown:
+        device = devices.get(mac) or {}
+        add("unknown", "New device on the network: " + describe_device(device, mac),
+            device={"mac": mac, "ip": device.get("ip") or "", "vendor": device.get("vendor") or "",
+                    "hostname": device.get("hostname") or ""})
+    for alert in alerts:
+        title, body = alert_title_body(alert)
+        add("alert", f"{title}: {body}", alert=dict(alert["data"], kind=alert["kind"]))
+    return events
+
+
+def event_env(event):
+    """The RECOGNITION_* variables of one event (spec §3.4); every value is a string."""
+    env = {"RECOGNITION_EVENT": event["event"], "RECOGNITION_MESSAGE": event["message"],
+           "RECOGNITION_HOME": ", ".join(event["home"]), "RECOGNITION_HOME_COUNT": str(len(event["home"])),
+           "RECOGNITION_GUESTS": ", ".join(event["guests"]),
+           "RECOGNITION_GUEST_COUNT": str(len(event["guests"])),
+           "RECOGNITION_JSON": json.dumps(event, ensure_ascii=False)}
+    person, device, alert = event["person"], event["device"], event["alert"]
+    if person:
+        env.update(RECOGNITION_PERSON_ID=person["id"], RECOGNITION_PERSON_NAME=person["name"],
+                   RECOGNITION_PERSON_EMOJI=person["emoji"])
+    if device:
+        env.update(RECOGNITION_DEVICE_MAC=device["mac"], RECOGNITION_DEVICE_IP=device["ip"],
+                   RECOGNITION_DEVICE_VENDOR=device["vendor"], RECOGNITION_DEVICE_HOSTNAME=device["hostname"])
+    if alert:
+        env.update(RECOGNITION_ALERT_KIND=alert["kind"], RECOGNITION_ALERT_IP=alert["ip"])
+    return env
+
+
+PERSON_EVENTS = ("arrive", "leave", "neighbor-arrive", "neighbor-leave", "guest-arrive", "guest-leave")
+
+
+def build_jobs(commands, events):
+    """One job per command and event it is marked for; person events also go
+    through the command's people filter (None is everyone)."""
+    jobs = []
+    for event in events:
+        env = event_env(event)
+        for command in commands:
+            if event["event"] not in command["events"]:
+                continue
+            if (event["event"] in PERSON_EVENTS and command["people"] is not None
+                    and event["person"]["id"] not in command["people"]):
+                continue
+            job = {"id": command["id"], "command": command["command"],
+                   "event": event["event"], "env": env}
+            if command.get("source"):
+                job["source"] = command["source"]
+            jobs.append(job)
+    return jobs
+
+
+def _present_names(people, devices):
+    """Names of the people connected, in the order status lists them (by arrival)."""
+    here = []
+    for person in people:
+        present, since, _ = person_presence(person, devices)
+        if present:
+            here.append((since, person["name"]))
+    here.sort(key=lambda item: (item[0], item[1].lower()))
+    return [name for _, name in here]
+
+
+def home_names(data, state):
+    """Names of the people at home."""
+    return _present_names(household_people(data), state["devices"])
+
+
+def guest_names(data, state):
+    """Names of the guests connected right now."""
+    return _present_names(guest_people(data), state["devices"])
+
+
+def launch_runner(jobs, environ):
+    """Start `recognition run-commands` in its own session and hand it the jobs.
+    Does not wait: the scan answers while the commands run. Returns the
+    process; scan ignores it."""
+    proc = subprocess.Popen([sys.executable, ENGINE_PATH, "run-commands"], stdin=subprocess.PIPE,
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=dict(environ),
+                            start_new_session=True, close_fds=True)
+    try:
+        proc.stdin.write((json.dumps({"jobs": jobs}, ensure_ascii=False) + "\n").encode("utf-8"))
+    finally:
+        with contextlib.suppress(OSError):
+            proc.stdin.close()
+    return proc
+
+
+# ---- readily
+
+READILY_PLUGIN_ID = "io.github.ferc10110.readily"
+READILY_TAG = "recognition"
+READILY_MAX = 50
+READILY_TIMEOUT = 10
+# readily's own exit code when it has no folder configured (its lib/readily/errors.py).
+READILY_NO_FOLDER = 4
+PLUGIN_DIR = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+
+
+def readily_bin(environ):
+    """Locate the readily binary: env override, sibling plugin, then PATH. A normal
+    install does not put it on PATH, so the sibling is the one that finds it; the
+    override is for the tests and for a worktree, which has no sibling."""
+    override = environ.get("RECOGNITION_READILY_BIN")
+    if override and os.path.isfile(override):
+        return override
+    sibling = os.path.join(os.path.dirname(PLUGIN_DIR), READILY_PLUGIN_ID, "bin", "readily")
+    if os.path.isfile(sibling):
+        return sibling
+    return shutil.which("readily", path=environ.get("PATH"))
+
+
+def readily_id(note, title):
+    """A stable id for a Readily item, keyed on its note and its title: editing the
+    command keeps it, renaming the item or moving it to another note changes it —
+    which is when it has become a different command."""
+    raw = b"recognition\0readily\0" + note.encode("utf-8") + b"\0" + title.encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()[:32]
+
+
+def readily_events(tags):
+    """The events a Readily item runs on: its recognition/<event> sub-tags, in EVENTS
+    order. An item with none left is manual — a tag nobody recognizes must never be
+    the reason something runs on its own."""
+    prefix = READILY_TAG + "/"
+    wanted = {tag[len(prefix):] for tag in tags if tag.startswith(prefix)}
+    return [event for event in EVENTS if event in wanted] or ["manual"]
+
+
+def readily_command(text):
+    """The command text of a Readily item, or "" when it cannot be one. Unlike a native
+    command it may span lines: in a note the command lives in a fenced code block, where
+    several lines are the normal shape. The rest is validate_command's rule.
+
+    The length cap also covers Readily's own truncation: it cuts the text it reports at
+    4 kB, which is past COMMAND_MAX, so a cut command is always skipped and never
+    reaches sh."""
+    if not isinstance(text, str):
+        return ""
+    text = text.strip()
+    if not 1 <= len(text) <= COMMAND_MAX:
+        return ""
+    if any((ord(ch) < 32 and ch not in "\n\t") or ord(ch) == 127 for ch in text):
+        return ""
+    return text
+
+
+def _readily_commands(sections):
+    """The commands in a `readily list --json` payload, and how many items were left out."""
+    commands, skipped = [], 0
+    for section in sections if isinstance(sections, list) else []:
+        if not isinstance(section, dict):
+            continue
+        note, items = section.get("name"), section.get("items")
+        if not isinstance(note, str) or not note or not isinstance(items, list):
+            continue
+        for item in items:
+            title = item.get("title") if isinstance(item, dict) else None
+            command = readily_command(item.get("search")) if isinstance(item, dict) and item.get("kind") == "text" else ""
+            if not command or not isinstance(title, str) or not title or len(commands) >= READILY_MAX:
+                skipped += 1
+                continue
+            tags = [tag for tag in (item.get("tags") or []) + (item.get("inheritedTags") or [])
+                    if isinstance(tag, str)]
+            commands.append({"id": readily_id(note, title), "command": command,
+                             "events": readily_events(tags), "people": None,
+                             "source": "readily", "note": note, "title": title})
+    return commands, skipped
+
+
+def _readily_failed(warning):
+    return {"commands": [], "ok": False, "warning": warning, "skipped": 0}
+
+
+def read_readily(environ, run):
+    """Every #recognition item in Readily, as commands. Never raises: a missing binary,
+    no folder, the CLI failing or an answer that cannot be parsed all degrade to an
+    empty result with a warning.
+
+    `ok` separates that degradation (False: callers must NOT read the empty list as
+    "there are no Readily commands") from a genuine read that found nothing (True)."""
+    try:
+        binary = readily_bin(environ)
+        if not binary:
+            return _readily_failed("Readily not found")
+        listing = run([binary, "list", "--tag", READILY_TAG, "--json"], capture_output=True, text=True,
+                       timeout=READILY_TIMEOUT, stdin=subprocess.DEVNULL)
+        if listing.returncode == READILY_NO_FOLDER:
+            return _readily_failed("Readily has no folder set")
+        if listing.returncode != 0:
+            return _readily_failed("Readily isn't available")
+        payload = json.loads(listing.stdout or "")
+        if not isinstance(payload, dict):
+            raise ValueError("not an object")
+        commands, skipped = _readily_commands(payload.get("sections"))
+        return {"commands": commands, "ok": True, "warning": "", "skipped": skipped}
+    except Exception:
+        traceback.print_exc(file=sys.stderr)
+        return _readily_failed("Readily isn't available")
+
+
+def readily_for(environ, run, data):
+    """read_readily when the setting is on, None when it is off."""
+    return read_readily(environ, run) if data["settings"]["readily"] else None
+
+
+def find_readily(readily, command_id):
+    """The Readily command with that id, or None. `readily` is the list of commands."""
+    for command in readily or ():
+        if command["id"] == command_id:
+            return command
+    return None
+
+
+def open_readily_note(note, environ, run):
+    """Hand a note to Readily, which opens it in Obsidian (or the editor the user picked).
+    The only thing Recognition asks Readily to do that is not a read — and it is not a
+    write either: it just launches an app."""
+    note = _text(note, "Note", 1, 200)
+    binary = readily_bin(environ)
+    if not binary:
+        raise RecognitionError("Readily not found")
+    try:
+        done = run([binary, "open", note], capture_output=True, text=True,
+                    timeout=READILY_TIMEOUT, stdin=subprocess.DEVNULL)
+    except subprocess.TimeoutExpired:
+        raise RecognitionError("Readily didn't answer") from None
+    if done.returncode != 0:
+        message = (done.stderr or "").strip().split("\n")[-1].strip()
+        raise RecognitionError(message[:MESSAGE_MAX] if message else "Readily couldn't open that note")
+    return note
+
+
+# ---- command runner
+
+COMMAND_TIMEOUT = 30
+KILL_GRACE = 2
+RUNNER_WORKERS = 8
+MESSAGE_MAX = 200
+STDERR_TAIL = 4096
+OUTPUT_MAX = 8192
+SAMPLE_PERSON = {"id": "0" * 32, "name": "Test", "emoji": "🧪"}
+SAMPLE_NEIGHBOR = {"id": "1" * 32, "name": "Neighbor", "emoji": "🧪", "group": "neighbor"}
+SAMPLE_GUEST = {"id": "2" * 32, "name": "Guest", "emoji": "🧪", "group": "guest"}
+SAMPLE_MAC = "02:00:00:00:00:01"
+SAMPLE_DEVICE = {"ip": "192.168.1.50", "vendor": "Example", "hostname": "test-device", "randomMac": False}
+SAMPLE_ALERT = {"kind": "ip-conflict",
+                "data": {"ip": "192.168.1.50", "previousMac": "02:00:00:00:00:01", "mac": "02:00:00:00:00:02"}}
+
+
+def _job_environ(environ, extra):
+    """The engine's environment without inherited RECOGNITION_* variables, plus the job's."""
+    env = {key: value for key, value in environ.items() if not key.startswith("RECOGNITION_")}
+    env.update(extra)
+    return env
+
+
+def _last_line(data):
+    """The last non-empty line of a command's stderr, without control characters, cut to MESSAGE_MAX."""
+    for line in reversed(data.decode("utf-8", errors="replace").splitlines()):
+        line = "".join(ch for ch in line if not _has_control(ch)).strip()
+        if line:
+            return line[:MESSAGE_MAX]
+    return ""
+
+
+def _group_alive(pgid):
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        pass
+    return True
+
+
+def _kill_group(proc, grace):
+    """SIGTERM the command's process group, and SIGKILL whatever is left after grace seconds."""
+    with contextlib.suppress(OSError):
+        os.killpg(proc.pid, signal.SIGTERM)
+    deadline = time.monotonic() + grace
+    while time.monotonic() < deadline:
+        if proc.poll() is not None and not _group_alive(proc.pid):
+            return
+        time.sleep(0.05)
+    with contextlib.suppress(OSError):
+        os.killpg(proc.pid, signal.SIGKILL)
+    with contextlib.suppress(subprocess.TimeoutExpired):
+        proc.wait(timeout=grace)
+
+
+def run_job(command, extra_env, environ, timeout=COMMAND_TIMEOUT, grace=KILL_GRACE):
+    """Run one command with sh -c in $HOME and wait for sh, not for what it leaves
+    in the background (stderr goes to a file, not a pipe). Returns
+    {"ok", "exit", "message", "seconds"}."""
+    started = time.monotonic()
+    with contextlib.ExitStack() as stack:
+        try:
+            err = stack.enter_context(tempfile.TemporaryFile())
+            proc = subprocess.Popen(["sh", "-c", command], cwd=environ.get("HOME") or "/",
+                                    env=_job_environ(environ, extra_env), stdin=subprocess.DEVNULL,
+                                    stdout=subprocess.DEVNULL, stderr=err, start_new_session=True,
+                                    close_fds=True)
+        except (OSError, ValueError) as exc:
+            code, message = None, str(exc)[:MESSAGE_MAX]
+        else:
+            try:
+                code = proc.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                _kill_group(proc, grace)
+                code, message = None, f"timed out after {timeout:g} s"
+            else:
+                err.seek(max(0, err.seek(0, os.SEEK_END) - STDERR_TAIL))
+                message = _last_line(err.read())
+    return {"ok": code == 0, "exit": code, "message": message, "seconds": round(time.monotonic() - started, 1)}
+
+
+def _clean_output(data):
+    """What a command printed, as the panel can show it: decoded, without control
+    characters other than newline and tab (the rule _sanitize_hostname uses for mDNS
+    names — a stray \\r or \\0 is rubbish inside a Text)."""
+    text = data.decode("utf-8", errors="replace")
+    return "".join(ch for ch in text if ch in "\n\t" or not _has_control(ch))
+
+
+def capture_job(command, extra_env, environ, timeout=COMMAND_TIMEOUT, grace=KILL_GRACE):
+    """run_job for a command the user started by hand: same sh -c in $HOME and same
+    process-group kill, but stdout and stderr come back merged in order, cut to
+    OUTPUT_MAX bytes from the head. `message` only says why there is nothing to read
+    (timed out, or could not start); when the command ran it is "". Stores nothing."""
+    started = time.monotonic()
+    output, truncated, message = "", False, ""
+    with contextlib.ExitStack() as stack:
+        try:
+            out = stack.enter_context(tempfile.TemporaryFile())
+            proc = subprocess.Popen(["sh", "-c", command], cwd=environ.get("HOME") or "/",
+                                    env=_job_environ(environ, extra_env), stdin=subprocess.DEVNULL,
+                                    stdout=out, stderr=subprocess.STDOUT, start_new_session=True,
+                                    close_fds=True)
+        except (OSError, ValueError) as exc:
+            code, message = None, str(exc)[:MESSAGE_MAX]
+        else:
+            try:
+                code = proc.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                _kill_group(proc, grace)
+                code, message = None, f"timed out after {timeout:g} s"
+            truncated = out.seek(0, os.SEEK_END) > OUTPUT_MAX
+            out.seek(0)
+            output = _clean_output(out.read(OUTPUT_MAX))
+    return {"ok": code == 0, "exit": code, "message": message, "seconds": round(time.monotonic() - started, 1),
+            "output": output, "truncated": truncated}
+
+
+def _valid_job(job):
+    return (isinstance(job, dict) and isinstance(job.get("id"), str) and isinstance(job.get("command"), str)
+            and job.get("event") in EVENTS and isinstance(job.get("env"), dict)
+            and all(isinstance(key, str) and key.startswith("RECOGNITION_") and isinstance(value, str)
+                    for key, value in job["env"].items()))
+
+
+def read_jobs(payload):
+    jobs = payload.get("jobs")
+    if not isinstance(jobs, list) or not all(_valid_job(job) for job in jobs):
+        raise RecognitionError("Jobs: must be a list of jobs")
+    return jobs
+
+
+def run_jobs(jobs, environ, workers=RUNNER_WORKERS, timeout=COMMAND_TIMEOUT, clock=utc_now):
+    """run-commands: every job, at most `workers` at a time; each result is stored as soon as it is known."""
+    def work(job):
+        result = run_job(job["command"], job["env"], environ, timeout)
+        record = {"at": iso(clock()), "event": job["event"], "command": job["command"]}
+        if job.get("source"):
+            record["source"] = job["source"]
+        record.update(result)
+        # run-commands has no stderr to report a failed save on, so a result that cannot
+        # be saved (e.g. commands.json's directory is unwritable) is dropped.
+        with contextlib.suppress(OSError):
+            record_result(environ, job["id"], record)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+        list(pool.map(work, jobs))
+    return len(jobs)
+
+
+def chosen_device(person, devices):
+    """The device a manual run targets when the target is a person (spec §3.2): the
+    first present one in the person's own order, else the one seen most recently, else
+    the first one they have. Only a person with no devices at all gets None: state.json
+    is a cache that can be deleted or arrive fresh, and a device it knows nothing about
+    is exactly what a wake-on-LAN command is for — the MAC, all that command needs,
+    lives in people.json."""
+    entries = person.get("devices") or []
+    for entry in entries:
+        if (devices.get(entry["mac"]) or {}).get("present"):
+            return entry["mac"]
+    seen = [(devices[entry["mac"]]["lastSeen"], entry["mac"]) for entry in entries
+            if (devices.get(entry["mac"]) or {}).get("lastSeen")]
+    if seen:
+        return max(seen, key=lambda item: item[0])[1]
+    return entries[0]["mac"] if entries else None
+
+
+def manual_event(person, mac, device, label, home, guests, now):
+    """The synthetic event a manual run passes through event_env (spec §3.3). person is
+    None on a device target, and mac is None for a person with no devices; label names
+    the device when there is no person to name."""
+    view = _person_view(person) if person else None
+    return {"event": "manual", "at": iso(now), "message": person["name"] if person else label,
+            "person": view, "people": [view] if view else [],
+            "home": list(home), "guests": list(guests),
+            "device": None if not mac else {"mac": mac, "ip": (device or {}).get("ip") or "",
+                                            "vendor": (device or {}).get("vendor") or "",
+                                            "hostname": (device or {}).get("hostname") or ""},
+            "alert": None}
+
+
+def device_label(data, mac, device):
+    """How a device is named to a manual command: the label whoever owns it gave it, or
+    else the `vendor · hostname · ip` description the engine falls back to for a device
+    nobody owns. Same fields the panel's row shows, composed differently."""
+    owner = owner_of(data, mac)
+    entries = data["house"] if owner == "house" else (owner["devices"] if owner else [])
+    for entry in entries:
+        if entry["mac"] == mac and entry["label"]:
+            return entry["label"]
+    return describe_device(device or {}, mac)
+
+
+def sample_event(event, people, data, state, now):
+    """One event of the given kind made of example data, for test-command (spec §3.7)."""
+    chosen = [person for person in (find_person(data, person_id) for person_id in people or []) if person]
+    if event == "manual":
+        pool = household_people(data) + neighbor_people(data) + guest_people(data)
+        person = (chosen or pool or [SAMPLE_PERSON])[0]
+        mac = chosen_device(person, state["devices"]) or SAMPLE_MAC
+        return manual_event(person, mac, state["devices"].get(mac) or SAMPLE_DEVICE, "",
+                            home_names(data, state), guest_names(data, state), now)
+    near = event in ("neighbor-arrive", "neighbor-leave")
+    visiting = event in ("guest-arrive", "guest-leave")
+    if near:
+        pool, fallback = neighbor_people(data), SAMPLE_NEIGHBOR
+    elif visiting:
+        pool, fallback = guest_people(data), SAMPLE_GUEST
+    else:
+        pool, fallback = household_people(data), SAMPLE_PERSON
+    allowed = {person["id"] for person in pool}
+    chosen = [person for person in chosen if person["id"] in allowed]
+    person = (chosen or pool or [fallback])[0]
+    came = [person] if event in ("arrive", "home-occupied", "neighbor-arrive", "guest-arrive") else []
+    went = [person] if event in ("leave", "home-empty", "neighbor-leave", "guest-leave") else []
+    if event == "home-empty":
+        home, guests = [], []
+    elif visiting:
+        home, guests = home_names(data, state), [person["name"]]
+    elif near:
+        home, guests = home_names(data, state), guest_names(data, state)
+    else:
+        home, guests = [person["name"]], guest_names(data, state)
+    unknown, devices, alerts = [], {}, []
+    if event == "unknown":
+        seen = [(device["lastSeen"], mac) for mac, device in state["devices"].items()
+                if device.get("lastSeen") and owner_of(data, mac) is None]
+        if seen:
+            unknown, devices = [max(seen)[1]], state["devices"]
+        else:
+            unknown, devices = [SAMPLE_MAC], {SAMPLE_MAC: SAMPLE_DEVICE}
+    elif event == "alert":
+        alerts = [SAMPLE_ALERT]
+    events = build_events(came, went, unknown, alerts, devices, 0, home, now, guests=guests,
+                          guests_occupy=data["settings"]["guestsOccupyHome"])
+    found = next((item for item in events if item["event"] == event), None)
+    if found is None:
+        raise RecognitionError(f"Couldn't build a sample {event} event")
+    return found
+
+
+def try_command(fields, data, state, environ, now, readily=(), timeout=COMMAND_TIMEOUT):
+    """test-command: run one command now with example data and wait for it. Stores nothing.
+    A Readily command is named by its id, never by its text: the text can span lines, and
+    resolving it here tests what the note says now."""
+    if fields.get("readilyId"):
+        found = find_readily(readily, fields["readilyId"])
+        if found is None:
+            raise RecognitionError("That command no longer exists")
+        command, event, people = found["command"], found["events"][0], None
+    else:
+        command = validate_command(fields.get("command"))
+        event = validate_events([fields.get("event")])[0]
+        people = validate_command_people(fields.get("people"))
+    env = dict(event_env(sample_event(event, people, data, state, now)), RECOGNITION_TEST="1")
+    return run_job(command, env, environ, timeout)
+
+
+def run_manual(command_id, target, data, state, environ, now, readily=(),
+               timeout=COMMAND_TIMEOUT, grace=KILL_GRACE):
+    """run-command: run one command marked Manual against a device ({"mac": …}), a person
+    and the device they picked ({"personId": …, "mac": …}), or a person alone
+    ({"personId": …}, where the engine chooses) and wait for it (spec §3.1). Refusing a
+    command that is not
+    marked Manual is what keeps this from becoming "run anything you have stored".
+    Stores nothing: no result, no people.json, no commands.json."""
+    command = find_command(data, command_id) or find_readily(readily, command_id)
+    if command is None:
+        raise RecognitionError("That command no longer exists")
+    if "manual" not in command["events"]:
+        raise RecognitionError("That command is not manual")
+    devices = state["devices"]
+    person, label = None, ""
+    if target.get("personId"):
+        person = _require_person(data, target["personId"])
+        if target.get("mac"):
+            # The panel names the device the user picked. Without a MAC -- a panel that
+            # was not restarted after the update, or a person with no devices at all --
+            # the engine still chooses, which is what chosen_device stays alive for.
+            mac = normalize_mac(target["mac"])
+            if mac not in {entry["mac"] for entry in person["devices"]}:
+                raise RecognitionError("That device is no longer theirs")
+        else:
+            mac = chosen_device(person, devices)
+    else:
+        mac = normalize_mac(target.get("mac"))
+        if mac not in devices and owner_of(data, mac) is None:
+            raise RecognitionError("Unknown device")
+        label = device_label(data, mac, devices.get(mac) or {})
+    event = manual_event(person, mac, devices.get(mac) if mac else None, label,
+                         home_names(data, state), guest_names(data, state), now)
+    return capture_job(command["command"], event_env(event), environ, timeout, grace)
+
+
+# ---- status
+
+RECENT_UNKNOWN = 86400
+
+
+def _device_view(entry, devices):
+    device = devices.get(entry["mac"]) or {}
+    return {"mac": entry["mac"], "label": entry["label"], "counts": entry.get("counts", True),
+            "present": bool(device.get("present")), "ip": device.get("ip", ""),
+            "lastSeen": device.get("lastSeen")}
+
+
+def _command_view(command, results):
+    """A command as status shows it. last is its stored result, only while the text is
+    the same. A Readily command carries where it came from, so the panel can mark it
+    and open its note."""
+    last = results.get(command["id"])
+    if last is None or last.get("command") != command["command"]:
+        last = None
+    else:
+        last = {key: value for key, value in last.items() if key != "command"}
+    view = {"id": command["id"], "command": command["command"], "events": list(command["events"]),
+            "people": None if command["people"] is None else list(command["people"]), "last": last}
+    if command.get("source"):
+        view.update(source=command["source"], note=command.get("note", ""), title=command.get("title", ""))
+    return view
+
+
+def _sorted_people(records, devices):
+    """People as status lists them: present by arrival, then away by last seen, then never seen by name."""
+    people = []
+    for person in records:
+        present, since, last = person_presence(person, devices)
+        people.append({"id": person["id"], "name": person["name"], "emoji": person["emoji"],
+                       "group": person.get("group", "home"),
+                       "notify": person.get("notify", True),
+                       "present": present, "since": since, "lastSeen": last,
+                       "devices": [_device_view(entry, devices) for entry in person["devices"]]})
+    here = sorted((p for p in people if p["present"]), key=lambda p: (p["since"], p["name"].lower()))
+    away = sorted((p for p in people if not p["present"] and p["lastSeen"]),
+                  key=lambda p: p["lastSeen"], reverse=True)
+    never = sorted((p for p in people if not p["present"] and not p["lastSeen"]), key=lambda p: p["name"].lower())
+    return here + away + never
+
+
+def build_status(data, state, now, results=None, readily=None):
+    devices = state["devices"]
+    people_view = _sorted_people(household_people(data), devices)
+    neighbor_view = _sorted_people(neighbor_people(data), devices)
+    guest_view = _sorted_people(guest_people(data), devices)
+
+    owned = {d["mac"] for p in data["people"] for d in p["devices"]} | {e["mac"] for e in data["house"]}
+    unknown = []
+    for mac, device in devices.items():
+        age = seconds_since(now, device.get("lastSeen"))
+        if mac in owned or age is None or age > RECENT_UNKNOWN:
+            continue
+        entry = {"mac": mac, "ip": device.get("ip", ""), "hostname": device.get("hostname", ""),
+                 "vendor": device.get("vendor", ""), "randomMac": bool(device.get("randomMac")),
+                 "present": bool(device.get("present")), "firstSeen": device.get("firstSeen"),
+                 "lastSeen": device.get("lastSeen")}
+        suggestion = suggest_owner(device, data, devices)
+        if suggestion:
+            entry["suggestion"] = suggestion
+        unknown.append(entry)
+    unknown.sort(key=lambda d: d["lastSeen"], reverse=True)
+    unknown.sort(key=lambda d: not d["present"])   # stable: present first
+
+    house_view = []
+    for entry in data["house"]:
+        device = devices.get(entry["mac"]) or {}
+        house_view.append({"mac": entry["mac"], "label": entry["label"], "present": bool(device.get("present")),
+                           "ip": device.get("ip", ""), "lastSeen": device.get("lastSeen")})
+    house_view.sort(key=lambda d: (not d["present"], d["label"].lower(), d["mac"]))
+    commands = data["commands"] + (readily["commands"] if readily else [])
+    return {"lastScan": state.get("lastScan"), "subnet": state.get("subnet", ""), "error": state.get("error"),
+            "people": people_view, "neighbors": neighbor_view, "guests": guest_view,
+            "unknown": unknown, "house": house_view,
+            "alerts": list(state["alerts"]), "settings": data["settings"],
+            "commands": [_command_view(command, results or {}) for command in commands],
+            "readily": {"enabled": bool(data["settings"]["readily"]),
+                        "ok": bool(readily and readily["ok"]),
+                        "warning": readily["warning"] if readily else "",
+                        "count": len(readily["commands"]) if readily else 0,
+                        "skipped": readily["skipped"] if readily else 0}}
+
+
+# ---- scan
+
+
+def scan(environ, run, now, force=False, oui_loader=None, spawn=None):
+    """One detection cycle (spec §4.2). Always answers the status."""
+    oui_loader = oui_loader or load_oui
+    spawn = spawn or launch_runner
+    data = load_people(people_path(environ))
+    settings = data["settings"]
+    # One read per cycle, before the lock: the jobs and every status this function can
+    # answer use the same list, so an early return cannot report an empty one and make
+    # the panel's command list flicker.
+    readily = readily_for(environ, run, data)
+    path = state_path(environ)
+    calls, jobs = [], []
+    with scan_lock(environ) as locked:
+        state, existed = load_state(path)
+        if not locked:
+            return build_status(data, state, now, load_results(environ), readily)
+        since_attempt = seconds_since(now, state.get("lastAttempt"))
+        if not force and since_attempt is not None and 0 <= since_attempt < settings["scanInterval"] / 2:
+            return build_status(data, state, now, load_results(environ), readily)
+        had_error = bool(state.get("error"))
+        # R21/R26: lastAttempt is measured start-to-start (not attempt-to-end)
+        # because a live scanner's attempts are at most one cycle (scanInterval)
+        # plus one allowance (SCAN_ALLOWANCE) apart, and a start-to-start gap is
+        # still right when the PC suspends mid-scan. A bigger gap means the
+        # scanner itself was not running (PC off/suspended, shell down), not
+        # that devices left; restart the presence clock so that gap is not read
+        # as absence. Failing cycles, including nmap timeouts, update lastAttempt
+        # too, so they stay within the allowance and are not read as a gap.
+        gap_from = None
+        if since_attempt is None or since_attempt > settings["scanInterval"] + SCAN_ALLOWANCE:
+            # A first scan is not a gap: there is nothing before it to bridge.
+            if since_attempt is not None and state.get("lastScan"):
+                gap_from = state["lastScan"]
+            state["watchingSince"] = iso(now)
+        state["lastAttempt"] = iso(now)
+        try:
+            net = resolve_network(settings, run)
+            up = nmap_up(run, net["network"])
+            neighbors = read_neighbors(run, net["network"])
+        except ScanError as exc:
+            state["error"] = str(exc)
+            apply_sightings(state, {}, now, settings["gracePeriod"], state.get("watchingSince"))
+            update_people(state, data, [], [])
+            _history_cycle(environ, state, data, settings, now, gap_from)
+            save_state(path, state)
+            return build_status(data, state, now, load_results(environ), readily)
+        seen = sightings(neighbors, up)
+        confirmed = confirmed_ips(neighbors, up)
+        arrived, left, new = apply_sightings(state, seen, now, settings["gracePeriod"], state.get("watchingSince"))
+        enrich(state, seen, new, now, run, oui_loader)
+        # People home before this cycle, read the way update_people reads "was".
+        # A guest counts as someone in the house only while the setting says so.
+        occupants = household_people(data)
+        if settings["guestsOccupyHome"]:
+            occupants = occupants + guest_people(data)
+        home_before = sum(1 for person in occupants
+                          if state["people"].get(person["id"], {}).get("present"))
+        came, went = update_people(state, data, arrived, left)
+        prune_dismissed(state, now)
+        alerts = check_gateway(state, net["gateway"], confirmed, now)
+        alerts += check_ip_conflicts(state, confirmed, now, settings["gracePeriod"], net["gateway"])
+        prune_devices(state, data, now)
+        state["error"] = None
+        state["lastScan"] = iso(now)
+        state["subnet"] = str(net["network"])
+        _history_cycle(environ, state, data, settings, now, gap_from)
+        save_state(path, state)
+        if existed:
+            if had_error:
+                came, went, unknown = [], [], []
+            else:
+                unknown = [mac for mac in arrived if owner_of(data, mac) is None]
+            calls = build_notifications(settings, came, went, unknown, alerts, state["devices"])
+            events = build_events(came, went, unknown, alerts, state["devices"], home_before,
+                                  home_names(data, state), now, guests=guest_names(data, state),
+                                  guests_occupy=settings["guestsOccupyHome"])
+            calls += build_home_notifications(settings, events)
+            jobs = build_jobs(data["commands"] + (readily["commands"] if readily else []), events)
+        status = build_status(data, state, now, load_results(environ), readily)
+    send_notifications(calls, run)
+    if jobs:
+        with contextlib.suppress(OSError):
+            spawn(jobs, environ)
+    return status
+
+
+# ---- cli
+
+PEOPLE_COMMANDS = ("save-person", "delete-person", "assign", "unassign", "house", "unhouse", "set-settings",
+                   "save-command", "delete-command")
+STATE_COMMANDS = ("forget", "accept-gateway", "dismiss-alert")
+
+
+def read_stdin_json(stdin):
+    line = stdin.readline()
+    if not line.strip():
+        raise RecognitionError("Missing input data")
+    try:
+        value = json.loads(line)
+    except ValueError:
+        raise RecognitionError("Input isn't valid JSON") from None
+    if not isinstance(value, dict):
+        raise RecognitionError("Input must be a JSON object")
+    return value
+
+
+def _arg(args, index, what):
+    if len(args) <= index or not args[index]:
+        raise RecognitionError(f"Missing {what}")
+    return args[index]
+
+
+def edit_people(command, args, data, state, stdin):
+    if command == "save-person":
+        save_person(data, read_stdin_json(stdin))
+    elif command == "delete-person":
+        delete_person(data, _arg(args, 0, "the person id"))
+    elif command in ("assign", "house"):
+        mac = normalize_mac(_arg(args, 0, "the MAC"))
+        person_id = _arg(args, 1, "the person id") if command == "assign" else None
+        label = read_stdin_json(stdin).get("label")
+        if label is None or (isinstance(label, str) and not label.strip()):
+            label = auto_label(state["devices"].get(mac))
+        if command == "assign":
+            assign(data, mac, person_id, label)
+        else:
+            house(data, mac, label)
+    elif command == "unassign":
+        unassign(data, _arg(args, 0, "the MAC"))
+    elif command == "unhouse":
+        unhouse(data, _arg(args, 0, "the MAC"))
+    elif command == "set-settings":
+        data["settings"] = validate_settings(read_stdin_json(stdin), data["settings"])
+    elif command == "save-command":
+        save_command(data, read_stdin_json(stdin))
+    elif command == "delete-command":
+        delete_command(data, _arg(args, 0, "the command id"))
+
+
+def edit_state(command, args, data, state, now):
+    if command == "forget":
+        forget_device(state, data, _arg(args, 0, "the MAC"))
+    elif command == "accept-gateway":
+        accept_gateway(state)
+    elif command == "dismiss-alert":
+        dismiss_alert(state, _arg(args, 0, "the alert id"), now)
+
+
+def dispatch(argv, environ, run, now, stdin, oui_loader, spawn):
+    if not argv:
+        raise RecognitionError(USAGE)
+    command, args = argv[0], argv[1:]
+    if command == "scan":
+        return scan(environ, run, now, force="--force" in args, oui_loader=oui_loader, spawn=spawn)
+    if command == "run-commands":
+        return {"ran": run_jobs(read_jobs(read_stdin_json(stdin)), environ)}
+    if command == "test-command":
+        fields = read_stdin_json(stdin)
+        state, _ = load_state(state_path(environ))
+        data = load_people(people_path(environ))
+        # Only the Readily shape needs the vault read; a native test says everything.
+        readily = readily_for(environ, run, data) if fields.get("readilyId") else None
+        return {"test": try_command(fields, data, state, environ, now,
+                                    readily["commands"] if readily else ())}
+    if command == "run-command":
+        state, _ = load_state(state_path(environ))
+        data = load_people(people_path(environ))
+        command_id = _arg(args, 0, "the command id")
+        # Only the Readily shape needs the vault read; a native id says everything.
+        readily = readily_for(environ, run, data) if find_command(data, command_id) is None else None
+        return {"run": run_manual(command_id, read_stdin_json(stdin),
+                                  data, state, environ, now, readily["commands"] if readily else ())}
+    if command == "history":
+        data = load_people(people_path(environ))
+        state, _ = load_state(state_path(environ))
+        return history_report(environ, data, state, data["settings"], now,
+                              _arg(args, 0, "the period"), _arg(args, 1, "the date"),
+                              args[2] if len(args) > 2 else None)
+    if command == "timeline":
+        data = load_people(people_path(environ))
+        state, _ = load_state(state_path(environ))
+        return timeline_report(environ, data, state, data["settings"], now,
+                               _arg(args, 0, "the period"), _arg(args, 1, "the date"))
+    if command == "readily-open":
+        return {"opened": open_readily_note(_arg(args, 0, "the note"), environ, run)}
+    if command == "delete-history":
+        data = load_people(people_path(environ))
+        with state_lock(environ):
+            state, existed = load_state(state_path(environ))
+            delete_history(environ, state)
+            # Only if there already was one: state.json is a cache the first scan
+            # rebuilds silently, and that silence is what keeps the rebuild from
+            # announcing everyone as arriving.
+            if existed:
+                save_state(state_path(environ), state)
+        return build_status(data, state, now, load_results(environ), readily_for(environ, run, data))
+    if command not in ("status",) + PEOPLE_COMMANDS + STATE_COMMANDS:
+        raise RecognitionError("Unknown command: " + command)
+    people_file, state_file = people_path(environ), state_path(environ)
+    data = load_people(people_file)
+    if command in STATE_COMMANDS:
+        with state_lock(environ):
+            state, _ = load_state(state_file)
+            edit_state(command, args, data, state, now)
+            save_state(state_file, state)
+        return build_status(data, state, now, load_results(environ), readily_for(environ, run, data))
+    state, _ = load_state(state_file)
+    if command in PEOPLE_COMMANDS:
+        # Their devices have to be read before edit_people takes them away.
+        doomed = []
+        if command == "delete-person":
+            person = find_person(data, args[0] if args else "")
+            if person is not None:
+                doomed = ([("person", person["id"])]
+                          + [("mac", entry["mac"]) for entry in person["devices"]])
+        was = {key: data["settings"][key] for key in HISTORY_KEYS}
+        edit_people(command, args, data, state, stdin)
+        save_people(people_file, data)
+        prune_results(environ, data)
+        # Only the keys the history cares about. The lane picker also lives in settings,
+        # and closing it must not read every month file on disk.
+        history_changed = any(data["settings"][key] != was[key] for key in HISTORY_KEYS)
+        if doomed or history_changed:
+            with state_lock(environ):
+                state_now, existed = load_state(state_file)
+                if doomed:
+                    forget_history(environ, state_now, doomed)
+                if history_changed:
+                    # A switch that just changed decides now: closing what is no longer
+                    # followed, opening what is, and applying a retention that just got
+                    # shorter instead of waiting for tomorrow.
+                    history_tick(environ, state_now, data, data["settings"], now)
+                    prune_history(environ, state_now, data["settings"], now, force=True)
+                # Files on disk are cleaned either way; state.json is only written when
+                # there already was one. Creating it here would rob the first scan of the
+                # silent rebuild it relies on to not announce everyone as arriving.
+                if existed:
+                    save_state(state_file, state_now)
+    return build_status(data, state, now, load_results(environ), readily_for(environ, run, data))
+
+
+def main(argv=None, *, environ=None, run=subprocess.run, now=utc_now, stdin=None, stdout=None,
+         oui_loader=None, spawn=None):
+    argv = sys.argv[1:] if argv is None else list(argv)
+    environ = os.environ if environ is None else environ
+    stdin = sys.stdin if stdin is None else stdin
+    stdout = sys.stdout if stdout is None else stdout
+    try:
+        payload, code = dispatch(argv, environ, run, now(), stdin, oui_loader, spawn), 0
+    except RecognitionError as exc:
+        payload, code = {"error": str(exc)}, 1
+    except OSError as exc:
+        payload, code = {"error": "System error: " + str(exc)}, 1
+    except Exception as exc:
+        traceback.print_exc(file=sys.stderr)
+        payload, code = {"error": f"Internal error: {type(exc).__name__}: {exc}"}, 1
+    stdout.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    stdout.flush()
+    return code
+
+
+if __name__ == "__main__":
+    sys.exit(main())

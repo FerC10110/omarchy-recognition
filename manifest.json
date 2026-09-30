@@ -1,0 +1,28 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.ferc10110.recognition",
+  "name": "Recognition",
+  "version": "1.0.0",
+  "author": "Fernando Cancro",
+  "license": "MIT",
+  "description": "See who is home at a glance: each person's emoji shows in the bar while one of their devices is on your network. Get notified when someone arrives, leaves or an unknown device joins, plus alerts for router MAC changes and IP conflicts.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Recognition",
+    "description": "Who is home, from the devices on your network",
+    "category": "Network",
+    "aliases": [
+      "recognition",
+      "presence",
+      "home",
+      "who"
+    ],
+    "allowMultiple": false,
+    "defaultSection": "left"
+  }
+}
