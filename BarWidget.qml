@@ -44,23 +44,24 @@ BarWidget {
     }
   }
 
-  BarIconButton {
+  // Omarchy 4.5 normalises BarIconButton's text as a single icon: the whole
+  // string is scaled into Style.bar.iconSize, so a face of several emoji
+  // ("🦊🐱 +2") shrinks to a few pixels however wide the slot is. Render the
+  // face as a text label instead — WidgetButton leaves label text at its own
+  // size and only normalises a single icon glyph, which the fallback face
+  // still is. horizontalMargin 4 keeps the old 8px of breathing room around
+  // the label, and fixedWidth keeps the old status slot as the minimum.
+  WidgetButton {
     id: button
     anchors.fill: parent
     bar: root.bar
     text: root.panel ? root.panel.barText : "\u{F02DC}"
-    // BarIconButton fixes its slot to `slotSize` along the bar's long axis —
-    // width when horizontal, height when vertical (its own fixedWidth/
-    // fixedHeight). Our face can be more than one glyph ("🦊🐱 +2"), which
-    // overflows the single-icon default, so widen the slot to the text's own
-    // painted width (glyphPaintedWidth, from the same OpticalGlyph the button
-    // already renders). Only in the horizontal case: in a vertical bar the
-    // slot's *width* still comes from the bar's fixed thickness regardless of
-    // slotSize, so growing slotSize there only changes height, which the
-    // painted (horizontal) text width has nothing to do with — leave it at
-    // the default so we don't waste vertical space for no benefit.
-    slotSize: vertical ? Style.bar.statusSlot
-                        : Math.max(Style.bar.statusSlot, glyphPaintedWidth + Style.space(8))
+    labelVisible: true
+    fontSize: Style.bar.iconFont
+    horizontalMargin: 4
+    fixedWidth: vertical ? -1
+                           : Math.max(Style.bar.statusSlot, labelWidth + Style.space(8))
+    fixedHeight: vertical ? Style.bar.statusSlot : -1
     dimmed: root.panel ? root.panel.barDimmed : true
     active: root.panel ? root.panel.barActive : false
     activeColor: root.panel ? root.panel.barActiveColor : Color.urgent
